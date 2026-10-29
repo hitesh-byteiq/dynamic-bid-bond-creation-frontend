@@ -2,6 +2,13 @@
 @source "../src";
 @import "tw-animate-css";
 
+@font-face {
+  font-family: BondDejaVu;
+  src: url("/fonts/DejaVuSans.ttf") format("truetype");
+  font-weight: 400;
+  font-display: swap;
+}
+
 @custom-variant dark (&:is(.dark *));
 
 /*
