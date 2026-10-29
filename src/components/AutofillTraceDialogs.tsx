@@ -14,13 +14,31 @@ import type { AutofillField, StageTrace } from "@/lib/autofill";
 function stageLabel(stage: string) {
   return (
     {
-      inspect: "1 · Inspect PDF",
-      calibrate: "2 · Calibrate schema",
-      map: "3 · Map source text",
-      fill: "4 · Fill PDF",
-      verify: "5 · Verify output",
+      inspect: "1/5 · Inspect PDF",
+      calibrate: "2/5 · Prepare schema",
+      map: "3/5 · Map values",
+      fill: "4/5 · Fill PDF",
+      verify: "5/5 · Verify PDF",
     }[stage] ?? stage
   );
+}
+
+function stageSummary(entry: StageTrace) {
+  const value = (key: string) => Number(entry.summary[key] ?? 0);
+  switch (entry.stage) {
+    case "inspect":
+      return `${value("pages")} pages · ${value("total_blank_candidates")} blanks found`;
+    case "calibrate":
+      return `${value("field_count")} fields · ${entry.summary["schema_status"] === "reviewed" ? "Ready to use" : "Needs schema review"}`;
+    case "map":
+      return `${value("verified")} verified · ${value("review")} need review · ${value("missing")} missing`;
+    case "fill":
+      return `${value("written")} written · ${value("overflow")} did not fit · ${value("manual")} manual`;
+    case "verify":
+      return `${value("passed")} passed · ${value("failed")} failed`;
+    default:
+      return "";
+  }
 }
 
 function formatted(value: unknown) {
@@ -139,7 +157,7 @@ export function RunTraceDialog({
           </div>
           <DialogDescription className="break-all">
             Run ID: {runId}
-            {failedStage ? ` · Failed at ${failedStage}` : ""}
+            {failedStage ? ` · Stopped at ${stageLabel(failedStage)}` : ""}
           </DialogDescription>
         </DialogHeader>
         <div className="min-h-0 flex-1 space-y-3 overflow-auto pr-1">
@@ -152,21 +170,25 @@ export function RunTraceDialog({
             <section key={entry.stage} className="rounded-xl border border-border bg-white p-4">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <h3 className="font-bold text-ink">{stageLabel(entry.stage)}</h3>
-                <span className="rounded-full bg-muted px-2.5 py-1 text-xs font-semibold">
-                  {entry.status} · {entry.duration_ms.toFixed(0)} ms
+                <span
+                  className={`rounded-full px-2.5 py-1 text-xs font-semibold ${entry.status === "failed" ? "bg-destructive/10 text-destructive" : "bg-success/10 text-success"}`}
+                >
+                  {entry.status === "failed"
+                    ? "Needs attention"
+                    : entry.status === "reused"
+                      ? "Ready from earlier review"
+                      : "Complete"}
                 </span>
               </div>
-              <div className="mt-3 flex flex-wrap gap-2">
-                {Object.entries(entry.summary).map(([key, value]) => (
-                  <span key={key} className="rounded-lg bg-cream/70 px-2.5 py-1.5 text-xs">
-                    <strong>{key.replaceAll("_", " ")}:</strong> {String(value)}
-                  </span>
-                ))}
-              </div>
+              <p className="mt-2 text-sm text-muted-foreground">
+                {entry.status === "failed"
+                  ? "This step could not finish. Check the message shown with the form and try again."
+                  : stageSummary(entry)}
+              </p>
               {Object.keys(entry.output).length > 0 && (
                 <details className="mt-3 rounded-lg border border-border bg-[#F7F8FB]">
                   <summary className="cursor-pointer px-3 py-2 text-xs font-bold text-steel-blue">
-                    View stage output
+                    View technical details
                   </summary>
                   <pre className="max-h-80 overflow-auto border-t border-border p-3 text-xs leading-5">
                     {formatted(entry.output)}
