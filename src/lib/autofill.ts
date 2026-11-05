@@ -6,6 +6,9 @@ export type AutofillField = {
   label: string;
   description: string | null;
   field_type: string;
+  field_name?: string | null;
+  blank_style?: string | null;
+  date_targets?: Array<{ component?: string; rect?: PdfRect; safe_rect?: PdfRect }>;
   page: number;
   blank_rect: PdfRect;
   entry_regions?: PdfRect[];
