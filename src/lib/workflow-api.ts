@@ -104,6 +104,44 @@ export async function runWorkflow(
   return finalResult;
 }
 
+/**
+ * Flatten an already-filled AcroForm PDF into normal (non-fillable) page content.
+ *
+ * This only runs PyMuPDF flattening on the backend. The caller is responsible
+ * for writing the latest review values into the AcroForm first (see
+ * `buildAcroFormPdf`), so the flattened result matches the values shown on
+ * the review screen.
+ */
+export async function flattenPdf(filledPdf: Blob, filename?: string): Promise<Blob> {
+  const formData = new FormData();
+  formData.append("file", filledPdf, filename || "filled_document.pdf");
+
+  const response = await fetch(`${apiBaseUrl()}/api/pdf/flatten`, {
+    method: "POST",
+    body: formData,
+    headers: { Accept: "application/pdf" },
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    let detail = body;
+    try {
+      const parsed: unknown = JSON.parse(body);
+      if (isRecord(parsed) && typeof parsed["detail"] === "string") detail = parsed["detail"];
+    } catch {
+      // Keep the response body as a readable HTTP error.
+    }
+    throw new Error(detail || `Flatten failed (HTTP ${response.status}).`);
+  }
+  return response.blob();
+}
+
+/**
+ * Legacy endpoint that re-runs the workflow before returning a PDF.
+ *
+ * Prefer `buildAcroFormPdf` + `flattenPdf` so review edits are preserved and
+ * no second AI run is triggered.
+ */
 export async function downloadFilledPdf({
   file,
   sourceText,

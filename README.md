@@ -12,6 +12,13 @@ again before returning the final PDF. The five-stage run trace is available for
 diagnosis. PDF preview boxes use outlines without colored fills, and partial
 results remain downloadable when final approval is not required.
 
+The **Download PDF** button produces a **Normal PDF** by default: the review
+values are written into the AcroForm PDF already returned by the workflow and
+flattened server-side so the result is locked for sharing. The dropdown arrow
+next to the button also offers an **Editable PDF** that keeps fillable form
+fields. Both formats use the latest values shown on the result screen and do
+not re-run the AI workflow.
+
 ## Local setup
 
 Start the backend from `../bid-bond-backend` using its README. Its database and

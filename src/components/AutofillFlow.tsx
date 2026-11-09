@@ -46,7 +46,7 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import { FilledPdfPreview } from "@/components/FilledPdfPreview";
 import {
-  downloadFilledPdf,
+  flattenPdf,
   runWorkflow,
   toReviewFields,
   type PdfType,
@@ -1262,26 +1262,28 @@ function WorkflowResultScreen({
     }
   };
 
-  const downloadFlattenedPdf = async () => {
-    if (!file) {
-      setDownloadError("The original PDF is no longer available. Edit the source and rerun.");
+  const downloadNormalPdf = async () => {
+    if (!pdfBase64) {
+      setDownloadError("The filled PDF is no longer available. Edit the source and rerun.");
       return;
     }
     setDownloading("normal");
     setDownloadError("");
     try {
-      const blob = await downloadFilledPdf({
-        file,
-        sourceText,
-        instructions,
-        pdfType: "normal",
-      });
-      const url = URL.createObjectURL(blob);
-      triggerDownload(url, `normal_${file.name}`);
+      // Build an editable PDF from the latest review values, then flatten it.
+      // This avoids re-running the AI workflow and preserves edits made on the
+      // result screen.
+      const filledBlob = await buildAcroFormPdf(pdfBase64, fields, values);
+      const flatBlob = await flattenPdf(
+        filledBlob,
+        result.pdf_filename || file?.name || "filled_document.pdf",
+      );
+      const url = URL.createObjectURL(flatBlob);
+      triggerDownload(url, `normal_${result.pdf_filename || file?.name || "filled_document.pdf"}`);
       window.setTimeout(() => URL.revokeObjectURL(url), 1000);
     } catch (error) {
       setDownloadError(
-        error instanceof Error ? error.message : "Could not download the flattened PDF.",
+        error instanceof Error ? error.message : "Could not download the normal PDF.",
       );
     } finally {
       setDownloading(null);
@@ -1315,51 +1317,66 @@ function WorkflowResultScreen({
           <Button variant="outline" onClick={onEditSource} disabled={downloading !== null}>
             <ArrowLeft size={15} /> Edit source and rerun
           </Button>
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button disabled={!pdfUrl && !pdfBase64 && !file}>
-                {downloading ? (
-                  <Loader2 size={16} className="animate-spin" />
-                ) : (
-                  <Download size={16} />
-                )}
-                {downloading ? "Preparing PDF…" : "Download PDF"}
-                <ChevronDown size={15} className="opacity-70" />
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="w-72">
-              <DropdownMenuLabel>Choose PDF format</DropdownMenuLabel>
-              <DropdownMenuSeparator />
-              <DropdownMenuItem
-                onSelect={() => void downloadEditablePdf()}
-                disabled={!pdfBase64 || downloading !== null}
-                className="items-start gap-2 py-2"
-              >
-                <FileText size={16} className="mt-0.5" />
-                <div className="flex flex-col gap-0.5">
-                  <span className="font-semibold">Editable PDF</span>
-                  <span className="text-xs text-muted-foreground">
-                    {downloading === "acroform"
-                      ? "Preparing editable PDF…"
-                      : "Form fields stay fillable (AcroForm)"}
-                  </span>
-                </div>
-              </DropdownMenuItem>
-              <DropdownMenuItem
-                onSelect={() => void downloadFlattenedPdf()}
-                disabled={!file || downloading !== null}
-                className="items-start gap-2 py-2"
-              >
-                <FileCheck2 size={16} className="mt-0.5" />
-                <div className="flex flex-col gap-0.5">
-                  <span className="font-semibold">Flattened PDF</span>
-                  <span className="text-xs text-muted-foreground">
-                    Values burned in, locked for sharing
-                  </span>
-                </div>
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
+          {/* Split download button: main action downloads the normal (flattened)
+              PDF; the dropdown arrow exposes both format choices. */}
+          <div className="flex items-center">
+            <Button
+              onClick={() => void downloadNormalPdf()}
+              disabled={!pdfBase64 || downloading !== null}
+              className="rounded-r-none"
+            >
+              {downloading === "normal" ? (
+                <Loader2 size={16} className="animate-spin" />
+              ) : (
+                <Download size={16} />
+              )}
+              {downloading === "normal" ? "Preparing PDF…" : "Download PDF"}
+            </Button>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  disabled={!pdfBase64 || downloading !== null}
+                  className="rounded-l-none border-l border-primary-foreground/20 px-2"
+                >
+                  <ChevronDown size={15} />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-72">
+                <DropdownMenuLabel>Choose PDF format</DropdownMenuLabel>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  onSelect={() => void downloadNormalPdf()}
+                  disabled={!pdfBase64 || downloading !== null}
+                  className="items-start gap-2 py-2"
+                >
+                  <FileCheck2 size={16} className="mt-0.5" />
+                  <div className="flex flex-col gap-0.5">
+                    <span className="font-semibold">Normal PDF</span>
+                    <span className="text-xs text-muted-foreground">
+                      {downloading === "normal"
+                        ? "Preparing normal PDF…"
+                        : "Values burned in, locked for sharing"}
+                    </span>
+                  </div>
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onSelect={() => void downloadEditablePdf()}
+                  disabled={!pdfBase64 || downloading !== null}
+                  className="items-start gap-2 py-2"
+                >
+                  <FileText size={16} className="mt-0.5" />
+                  <div className="flex flex-col gap-0.5">
+                    <span className="font-semibold">Editable PDF</span>
+                    <span className="text-xs text-muted-foreground">
+                      {downloading === "acroform"
+                        ? "Preparing editable PDF…"
+                        : "Form fields stay fillable (AcroForm)"}
+                    </span>
+                  </div>
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
         </div>
       </header>
 
