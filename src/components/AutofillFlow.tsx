@@ -6,6 +6,7 @@ import {
   Brain,
   Braces,
   Check,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   Download,
@@ -34,11 +35,21 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Textarea } from "@/components/ui/textarea";
 import { FilledPdfPreview } from "@/components/FilledPdfPreview";
 import {
+  downloadFilledPdf,
   runWorkflow,
   toReviewFields,
+  type PdfType,
   type WorkflowEvent,
   type WorkflowResponse,
 } from "@/lib/workflow-api";
@@ -247,6 +258,9 @@ export function AutofillFlow() {
                 result={result}
                 pdfUrl={pdfUrl}
                 pdfBase64={result.pdf_base64}
+                file={file}
+                sourceText={rawText}
+                instructions={instructions}
                 onEditSource={() => setStage("source")}
               />
             ) : null}
@@ -1186,11 +1200,17 @@ function WorkflowResultScreen({
   result,
   pdfUrl,
   pdfBase64,
+  file,
+  sourceText,
+  instructions,
   onEditSource,
 }: {
   result: WorkflowResponse;
   pdfUrl: string | null;
   pdfBase64: string | null;
+  file: File | null;
+  sourceText: string;
+  instructions: string;
   onEditSource: () => void;
 }) {
   const fields = useMemo(() => toReviewFields(result), [result]);
@@ -1216,6 +1236,49 @@ function WorkflowResultScreen({
   const reviewCount = result.unresolved_fields.length;
   const completed = result.status === "completed" && reviewCount === 0;
   const activePdfUrl = previewUrl ?? pdfUrl;
+  const [downloading, setDownloading] = useState<PdfType | null>(null);
+  const [downloadError, setDownloadError] = useState("");
+
+  const triggerDownload = (url: string, filename: string) => {
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  };
+
+  const downloadEditablePdf = () => {
+    if (!activePdfUrl) return;
+    setDownloadError("");
+    triggerDownload(activePdfUrl, result.pdf_filename || "filled_document.pdf");
+  };
+
+  const downloadFlattenedPdf = async () => {
+    if (!file) {
+      setDownloadError("The original PDF is no longer available. Edit the source and rerun.");
+      return;
+    }
+    setDownloading("normal");
+    setDownloadError("");
+    try {
+      const blob = await downloadFilledPdf({
+        file,
+        sourceText,
+        instructions,
+        pdfType: "normal",
+      });
+      const url = URL.createObjectURL(blob);
+      triggerDownload(url, `normal_${file.name}`);
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (error) {
+      setDownloadError(
+        error instanceof Error ? error.message : "Could not download the flattened PDF.",
+      );
+    } finally {
+      setDownloading(null);
+    }
+  };
 
   useEffect(() => {
     if (!pdfBase64 || Object.keys(edits).length === 0) {
@@ -1328,23 +1391,60 @@ function WorkflowResultScreen({
           <p className="text-sm text-muted-foreground">{result.pdf_filename || "Uploaded PDF"}</p>
         </div>
         <div className="flex gap-2">
-          <Button variant="outline" onClick={onEditSource}>
+          <Button variant="outline" onClick={onEditSource} disabled={downloading !== null}>
             <ArrowLeft size={15} /> Edit source and rerun
           </Button>
-          {activePdfUrl && !updatingPreview && (
-            <Button asChild>
-              <a href={activePdfUrl} download={result.pdf_filename || "filled_document.pdf"}>
-                <Download size={16} /> Download editable PDF
-              </a>
-            </Button>
-          )}
-          {activePdfUrl && updatingPreview && (
-            <Button disabled>
-              <Loader2 size={16} className="animate-spin" /> Updating PDF
-            </Button>
-          )}
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button disabled={!activePdfUrl && !file}>
+                {downloading ? (
+                  <Loader2 size={16} className="animate-spin" />
+                ) : (
+                  <Download size={16} />
+                )}
+                {downloading ? "Preparing flattened PDF…" : "Download PDF"}
+                <ChevronDown size={15} className="opacity-70" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-72">
+              <DropdownMenuLabel>Choose PDF format</DropdownMenuLabel>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                onSelect={downloadEditablePdf}
+                disabled={!activePdfUrl || updatingPreview}
+                className="items-start gap-2 py-2"
+              >
+                <FileText size={16} className="mt-0.5" />
+                <div className="flex flex-col gap-0.5">
+                  <span className="font-semibold">Editable PDF</span>
+                  <span className="text-xs text-muted-foreground">
+                    {updatingPreview ? "Updating preview…" : "Form fields stay fillable (AcroForm)"}
+                  </span>
+                </div>
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onSelect={() => void downloadFlattenedPdf()}
+                disabled={!file || downloading !== null}
+                className="items-start gap-2 py-2"
+              >
+                <FileCheck2 size={16} className="mt-0.5" />
+                <div className="flex flex-col gap-0.5">
+                  <span className="font-semibold">Flattened PDF</span>
+                  <span className="text-xs text-muted-foreground">
+                    Values burned in, locked for sharing
+                  </span>
+                </div>
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
       </header>
+
+      {downloadError && (
+        <div className="border-b border-destructive/20 bg-destructive/5 px-5 py-2 text-sm text-destructive">
+          {downloadError}
+        </div>
+      )}
 
       {!completed && result.status !== "failed" && (
         <div className="flex items-start gap-2 border-b border-amber-300 bg-amber-50 px-5 py-3 text-sm text-amber-950">

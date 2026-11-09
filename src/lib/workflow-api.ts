@@ -5,6 +5,8 @@ export type WorkflowEvent = {
   data: Record<string, unknown>;
 };
 
+export type PdfType = "acroform" | "normal";
+
 export type WorkflowResponse = {
   workflow_id: string;
   status: "completed" | "needs_review" | "failed" | string;
@@ -20,16 +22,16 @@ export type WorkflowResponse = {
   quality: Record<string, unknown>;
 };
 
+function apiBaseUrl() {
+  return String(import.meta.env.VITE_API_BASE_URL || "http://localhost:8000").replace(/\/$/, "");
+}
+
 export async function runWorkflow(
   formData: FormData,
   onEvent: (event: WorkflowEvent) => void,
   signal?: AbortSignal,
 ): Promise<WorkflowResponse> {
-  const baseUrl = String(import.meta.env.VITE_API_BASE_URL || "http://localhost:8000").replace(
-    /\/$/,
-    "",
-  );
-  const response = await fetch(`${baseUrl}/api/workflow/stream`, {
+  const response = await fetch(`${apiBaseUrl()}/api/workflow/stream`, {
     method: "POST",
     body: formData,
     ...(signal ? { signal } : {}),
@@ -97,6 +99,43 @@ export async function runWorkflow(
   if (streamFailure) throw new Error(streamFailure);
   if (!finalResult) throw new Error("Workflow stream ended before its final result arrived.");
   return finalResult;
+}
+
+export async function downloadFilledPdf({
+  file,
+  sourceText,
+  instructions,
+  pdfType,
+}: {
+  file: File;
+  sourceText: string;
+  instructions?: string;
+  pdfType: PdfType;
+}): Promise<Blob> {
+  const formData = new FormData();
+  formData.append("file", file, file.name);
+  formData.append("source_text", sourceText);
+  if (instructions?.trim()) formData.append("instructions", instructions.trim());
+  formData.append("pdf_type", pdfType);
+
+  const response = await fetch(`${apiBaseUrl()}/api/workflow/run/download`, {
+    method: "POST",
+    body: formData,
+    headers: { Accept: "application/pdf" },
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    let detail = body;
+    try {
+      const parsed: unknown = JSON.parse(body);
+      if (isRecord(parsed) && typeof parsed["detail"] === "string") detail = parsed["detail"];
+    } catch {
+      // Keep the response body as a readable HTTP error.
+    }
+    throw new Error(detail || `Download failed (HTTP ${response.status}).`);
+  }
+  return response.blob();
 }
 
 export function toReviewFields(result: WorkflowResponse): AutofillField[] {
