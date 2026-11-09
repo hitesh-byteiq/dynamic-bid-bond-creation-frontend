@@ -16,6 +16,9 @@ export type WorkflowResponse = {
   detected_fields: Array<Record<string, unknown>>;
   mapped_fields: Array<Record<string, unknown>>;
   unresolved_fields: Array<Record<string, unknown>>;
+  /** field_id -> AcroForm widget name, produced by the S4 fill stage. */
+  field_widget_names?: Record<string, string>;
+  composite_widget_names?: Record<string, string[]>;
   verdict: Record<string, unknown> | null;
   tool_calls: Array<Record<string, unknown>>;
   repair_history: Array<Record<string, unknown>>;
@@ -143,6 +146,7 @@ export function toReviewFields(result: WorkflowResponse): AutofillField[] {
   const unresolved = new Map(
     result.unresolved_fields.map((field) => [String(field["field_id"]), field]),
   );
+  const widgetNames = result.field_widget_names ?? {};
   return result.detected_fields.flatMap((detected) => {
     const id = String(detected["field_id"] ?? "");
     const mapping = mappings.get(id);
@@ -172,6 +176,9 @@ export function toReviewFields(result: WorkflowResponse): AutofillField[] {
         description: typeof detected["description"] === "string" ? detected["description"] : null,
         field_type: String(detected["field_type"] ?? "text"),
         field_name: typeof detected["field_name"] === "string" ? detected["field_name"] : null,
+        widget_name:
+          widgetNames[id] ??
+          (typeof detected["field_name"] === "string" ? detected["field_name"] : null),
         blank_style: typeof detected["blank_style"] === "string" ? detected["blank_style"] : null,
         ...(Array.isArray(detected["date_targets"])
           ? {

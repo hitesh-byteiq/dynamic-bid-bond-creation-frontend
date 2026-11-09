@@ -53,6 +53,8 @@ import {
   type WorkflowEvent,
   type WorkflowResponse,
 } from "@/lib/workflow-api";
+import { useFieldValues } from "@/lib/use-field-values";
+import { buildAcroFormPdf } from "@/lib/pdf-form-values";
 import {
   addSchemaField,
   availableCandidates,
@@ -1214,28 +1216,19 @@ function WorkflowResultScreen({
   onEditSource: () => void;
 }) {
   const fields = useMemo(() => toReviewFields(result), [result]);
-  const pageCount = Math.max(1, ...fields.map((field) => field.page));
-  const pages = Array.from({ length: pageCount }, (_, index) => ({
-    page: index + 1,
-    width: 612,
-    height: 792,
-    rotation: 0,
-  }));
+  const { values, dirty, setValue } = useFieldValues(fields, result.workflow_id);
   const [selectedId, setSelectedId] = useState<string | null>(fields[0]?.field_id ?? null);
   const [page, setPage] = useState(1);
+  const [pageCount, setPageCount] = useState(() =>
+    Math.max(1, ...fields.map((field) => field.page)),
+  );
   const [zoom, setZoom] = useState(defaultZoom);
-  const [edits, setEdits] = useState<Record<string, string>>({});
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
-  const [previewError, setPreviewError] = useState("");
-  const [updatingPreview, setUpdatingPreview] = useState(false);
+  const [showHighlights, setShowHighlights] = useState(false);
   const mappedCount = fields.filter(
-    (field) =>
-      (edits[field.field_id] ?? field.mapped_value) !== null &&
-      (edits[field.field_id] ?? field.mapped_value) !== "",
+    (field) => (values[field.field_id] ?? field.mapped_value ?? "") !== "",
   ).length;
   const reviewCount = result.unresolved_fields.length;
   const completed = result.status === "completed" && reviewCount === 0;
-  const activePdfUrl = previewUrl ?? pdfUrl;
   const [downloading, setDownloading] = useState<PdfType | null>(null);
   const [downloadError, setDownloadError] = useState("");
 
@@ -1248,10 +1241,25 @@ function WorkflowResultScreen({
     link.remove();
   };
 
-  const downloadEditablePdf = () => {
-    if (!activePdfUrl) return;
+  const downloadEditablePdf = async () => {
+    if (!pdfBase64) {
+      setDownloadError("The filled PDF is no longer available. Edit the source and rerun.");
+      return;
+    }
     setDownloadError("");
-    triggerDownload(activePdfUrl, result.pdf_filename || "filled_document.pdf");
+    setDownloading("acroform");
+    try {
+      const blob = await buildAcroFormPdf(pdfBase64, fields, values);
+      const url = URL.createObjectURL(blob);
+      triggerDownload(url, result.pdf_filename || "filled_document.pdf");
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (error) {
+      setDownloadError(
+        error instanceof Error ? error.message : "Could not prepare the editable PDF.",
+      );
+    } finally {
+      setDownloading(null);
+    }
   };
 
   const downloadFlattenedPdf = async () => {
@@ -1281,99 +1289,12 @@ function WorkflowResultScreen({
   };
 
   useEffect(() => {
-    if (!pdfBase64 || Object.keys(edits).length === 0) {
-      setPreviewUrl(null);
-      setPreviewError("");
-      return;
-    }
-    let cancelled = false;
-    const timer = window.setTimeout(() => {
-      void (async () => {
-        setUpdatingPreview(true);
-        setPreviewError("");
-        try {
-          const [{ PDFDocument }, { bytes }] = await Promise.all([
-            import("pdf-lib"),
-            Promise.resolve().then(() => {
-              const binary = atob(pdfBase64);
-              const bytes = new Uint8Array(binary.length);
-              for (let index = 0; index < binary.length; index += 1)
-                bytes[index] = binary.charCodeAt(index);
-              return { bytes };
-            }),
-          ]);
-          const document = await PDFDocument.load(bytes);
-          const form = document.getForm();
-          const names = new Set(form.getFields().map((field) => field.getName()));
-          for (const field of fields) {
-            const value = edits[field.field_id] ?? field.mapped_value ?? "";
-            const baseName = field.field_name || field.field_id;
-            if (field.blank_style === "composite_date" && field.date_targets?.length) {
-              const match = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-              if (!match) continue;
-              const year = match[1] ?? "";
-              const monthNumber = Number(match[2] ?? "0");
-              const day = Number(match[3] ?? "0");
-              const parts: Record<string, string> = {
-                day: String(day),
-                month: new Date(Number(year), monthNumber - 1, 1).toLocaleString("en-US", {
-                  month: "long",
-                }),
-                year_2digit: year.slice(-2),
-              };
-              for (const target of field.date_targets) {
-                const name = `${baseName}__${target.component ?? ""}`;
-                if (names.has(name) && target.component && parts[target.component] !== undefined)
-                  form.getTextField(name).setText(parts[target.component]);
-              }
-            } else if (names.has(baseName)) {
-              if (field.field_type.toLowerCase().includes("checkbox")) {
-                const checkbox = form.getCheckBox(baseName);
-                if (["true", "yes", "1", "checked"].includes(value.trim().toLowerCase()))
-                  checkbox.check();
-                else checkbox.uncheck();
-              } else {
-                form.getTextField(baseName).setText(value);
-              }
-            }
-          }
-          form.updateFieldAppearances();
-          const editedBytes = await document.save();
-          if (cancelled) return;
-          const blobBuffer = new ArrayBuffer(editedBytes.byteLength);
-          new Uint8Array(blobBuffer).set(editedBytes);
-          const url = URL.createObjectURL(new Blob([blobBuffer], { type: "application/pdf" }));
-          setPreviewUrl((previous) => {
-            if (previous) URL.revokeObjectURL(previous);
-            return url;
-          });
-        } catch (error) {
-          if (!cancelled)
-            setPreviewError(
-              error instanceof Error ? error.message : "Could not update the PDF preview.",
-            );
-        } finally {
-          if (!cancelled) setUpdatingPreview(false);
-        }
-      })();
-    }, 250);
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timer);
-    };
-  }, [pdfBase64, edits, fields]);
-
-  useEffect(
-    () => () => {
-      if (previewUrl) URL.revokeObjectURL(previewUrl);
-    },
-    [previewUrl],
-  );
-
-  useEffect(() => {
     if (selectedId) {
       const selected = fields.find((field) => field.field_id === selectedId);
       if (selected) setPage(selected.page);
+      document
+        .getElementById(`field-card-${selectedId}`)
+        ?.scrollIntoView({ block: "nearest", behavior: "smooth" });
     }
   }, [fields, selectedId]);
 
@@ -1396,13 +1317,13 @@ function WorkflowResultScreen({
           </Button>
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
-              <Button disabled={!activePdfUrl && !file}>
+              <Button disabled={!pdfUrl && !pdfBase64 && !file}>
                 {downloading ? (
                   <Loader2 size={16} className="animate-spin" />
                 ) : (
                   <Download size={16} />
                 )}
-                {downloading ? "Preparing flattened PDF…" : "Download PDF"}
+                {downloading ? "Preparing PDF…" : "Download PDF"}
                 <ChevronDown size={15} className="opacity-70" />
               </Button>
             </DropdownMenuTrigger>
@@ -1410,15 +1331,17 @@ function WorkflowResultScreen({
               <DropdownMenuLabel>Choose PDF format</DropdownMenuLabel>
               <DropdownMenuSeparator />
               <DropdownMenuItem
-                onSelect={downloadEditablePdf}
-                disabled={!activePdfUrl || updatingPreview}
+                onSelect={() => void downloadEditablePdf()}
+                disabled={!pdfBase64 || downloading !== null}
                 className="items-start gap-2 py-2"
               >
                 <FileText size={16} className="mt-0.5" />
                 <div className="flex flex-col gap-0.5">
                   <span className="font-semibold">Editable PDF</span>
                   <span className="text-xs text-muted-foreground">
-                    {updatingPreview ? "Updating preview…" : "Form fields stay fillable (AcroForm)"}
+                    {downloading === "acroform"
+                      ? "Preparing editable PDF…"
+                      : "Form fields stay fillable (AcroForm)"}
                   </span>
                 </div>
               </DropdownMenuItem>
@@ -1512,26 +1435,35 @@ function WorkflowResultScreen({
                     <ZoomIn size={15} />
                   </Button>
                 </div>
+                <Button
+                  size="sm"
+                  variant={showHighlights ? "outline" : "ghost"}
+                  aria-pressed={showHighlights}
+                  onClick={() => setShowHighlights((value) => !value)}
+                >
+                  <Eye size={15} />
+                  {showHighlights ? "Hide highlights" : "Show highlights"}
+                </Button>
               </div>
-              {updatingPreview && (
-                <div className="px-4 py-1 text-xs text-muted-foreground" aria-live="polite">
-                  Updating PDF preview…
-                </div>
-              )}
-              {previewError && (
-                <div className="px-4 py-1 text-xs text-destructive" role="status">
-                  Preview update issue: {previewError}
+              {dirty.size > 0 && (
+                <div
+                  className="border-b px-4 py-1 text-xs font-medium text-primary"
+                  aria-live="polite"
+                >
+                  Live preview · {dirty.size} field{dirty.size === 1 ? "" : "s"} edited
                 </div>
               )}
               <FilledPdfPreview
-                pdfUrl={activePdfUrl ?? pdfUrl}
-                pages={pages}
+                pdfUrl={pdfUrl}
                 fields={fields}
-                showBoxes
+                values={values}
+                onValueChange={setValue}
                 selectedFieldId={selectedId}
                 onSelectField={setSelectedId}
                 page={page}
                 scale={zoom / 100}
+                showHighlights={showHighlights}
+                onPageCountChange={setPageCount}
               />
             </div>
           ) : (
@@ -1549,61 +1481,63 @@ function WorkflowResultScreen({
             </span>
           </div>
           <div className="space-y-2">
-            {fields.map((field) => (
-              <div
-                key={field.field_id}
-                onClick={() => {
-                  setSelectedId(field.field_id);
-                  setPage(field.page);
-                }}
-                className={`w-full rounded-xl border p-3 text-left ${selectedId === field.field_id ? "border-primary bg-primary/5" : "border-border"}`}
-              >
-                <div className="flex items-start justify-between gap-3">
-                  <span className="font-semibold">{field.label}</span>
-                  <span
-                    className={`shrink-0 text-xs font-semibold ${field.status === "filled" ? "text-success" : "text-amber-700"}`}
-                  >
-                    {(edits[field.field_id] ?? field.mapped_value)
-                      ? field.status === "filled"
-                        ? "Filled · editable"
-                        : "Needs review · editable"
-                      : field.status === "filled"
-                        ? "Filled · editable"
-                        : field.mapped_value
-                          ? "Needs review"
-                          : "Unmapped"}
-                  </span>
-                </div>
-                <label
-                  className="mt-2 block text-xs font-medium text-muted-foreground"
-                  htmlFor={`edit-${field.field_id}`}
-                >
-                  Value
-                </label>
-                <input
-                  id={`edit-${field.field_id}`}
-                  value={edits[field.field_id] ?? field.mapped_value ?? ""}
-                  disabled={field.field_type.toLowerCase().includes("signature")}
-                  onFocus={() => {
+            {fields.map((field) => {
+              const currentValue = values[field.field_id] ?? field.mapped_value ?? "";
+              return (
+                <div
+                  key={field.field_id}
+                  id={`field-card-${field.field_id}`}
+                  onClick={() => {
                     setSelectedId(field.field_id);
                     setPage(field.page);
                   }}
-                  onChange={(event) =>
-                    setEdits((current) => ({ ...current, [field.field_id]: event.target.value }))
-                  }
-                  className="mt-1 w-full rounded-md border border-border bg-white px-3 py-2 text-sm text-foreground outline-none focus:border-primary focus:ring-2 focus:ring-primary/20 disabled:bg-muted"
-                  placeholder="Enter a value"
-                />
-                {field.source_quote && (
-                  <p className="mt-2 text-xs text-muted-foreground">
-                    Evidence: {field.source_quote}
-                  </p>
-                )}
-                {field.reason && (
-                  <p className="mt-2 text-xs text-amber-800">Review: {field.reason}</p>
-                )}
-              </div>
-            ))}
+                  className={`w-full rounded-xl border p-3 text-left ${selectedId === field.field_id ? "border-primary bg-primary/5" : "border-border"}`}
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <span className="font-semibold">{field.label}</span>
+                    <span
+                      className={`shrink-0 text-xs font-semibold ${field.status === "filled" ? "text-success" : "text-amber-700"}`}
+                    >
+                      {currentValue
+                        ? field.status === "filled"
+                          ? "Filled · editable"
+                          : "Needs review · editable"
+                        : field.status === "filled"
+                          ? "Filled · editable"
+                          : field.mapped_value
+                            ? "Needs review"
+                            : "Unmapped"}
+                    </span>
+                  </div>
+                  <label
+                    className="mt-2 block text-xs font-medium text-muted-foreground"
+                    htmlFor={`edit-${field.field_id}`}
+                  >
+                    Value
+                  </label>
+                  <input
+                    id={`edit-${field.field_id}`}
+                    value={currentValue}
+                    disabled={field.field_type.toLowerCase().includes("signature")}
+                    onFocus={() => {
+                      setSelectedId(field.field_id);
+                      setPage(field.page);
+                    }}
+                    onChange={(event) => setValue(field.field_id, event.target.value)}
+                    className="mt-1 w-full rounded-md border border-border bg-white px-3 py-2 text-sm text-foreground outline-none focus:border-primary focus:ring-2 focus:ring-primary/20 disabled:bg-muted"
+                    placeholder="Enter a value"
+                  />
+                  {field.source_quote && (
+                    <p className="mt-2 text-xs text-muted-foreground">
+                      Evidence: {field.source_quote}
+                    </p>
+                  )}
+                  {field.reason && (
+                    <p className="mt-2 text-xs text-amber-800">Review: {field.reason}</p>
+                  )}
+                </div>
+              );
+            })}
             {fields.length === 0 && (
               <p className="text-sm text-muted-foreground">No field results were returned.</p>
             )}
