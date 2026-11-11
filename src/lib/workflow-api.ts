@@ -61,8 +61,8 @@ export async function finalizeReviewedPdf({
   values: Record<string, string>;
   pdfType: PdfType;
   filename: string;
-  compositeWidgetNames?: Record<string, string[]>;
-}): Promise<Blob> {
+  compositeWidgetNames?: Record<string, string[]> | undefined;
+}): Promise<{ blob: Blob; warnings: string[] }> {
   const fieldPayload = fields.map((field) => {
     const names = compositeWidgetNames[field.field_id] ?? [];
     const componentWidgetNames: Record<string, string> = {};
@@ -102,7 +102,19 @@ export async function finalizeReviewedPdf({
     }
     throw new Error(detail || `PDF finalization failed (HTTP ${response.status}).`);
   }
-  return response.blob();
+
+  const warningsHeader = response.headers.get("X-Pdf-Warnings");
+  let warnings: string[] = [];
+  if (warningsHeader) {
+    try {
+      const parsed: unknown = JSON.parse(warningsHeader);
+      if (Array.isArray(parsed)) warnings = parsed.filter((item): item is string => typeof item === "string");
+    } catch {
+      // Ignore malformed warning header.
+    }
+  }
+
+  return { blob: await response.blob(), warnings };
 }
 
 export async function runWorkflow(

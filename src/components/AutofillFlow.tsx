@@ -1236,6 +1236,7 @@ function WorkflowResultScreen({
   const completed = result.status === "completed" && reviewCount === 0;
   const [downloading, setDownloading] = useState<PdfType | null>(null);
   const [downloadError, setDownloadError] = useState("");
+  const [downloadWarning, setDownloadWarning] = useState("");
 
   const triggerDownload = (url: string, filename: string) => {
     const link = document.createElement("a");
@@ -1252,9 +1253,10 @@ function WorkflowResultScreen({
       return;
     }
     setDownloadError("");
+    setDownloadWarning("");
     setDownloading("acroform");
     try {
-      const blob = await finalizeReviewedPdf({
+      const { blob, warnings } = await finalizeReviewedPdf({
         pdfBase64,
         fields,
         values,
@@ -1265,6 +1267,12 @@ function WorkflowResultScreen({
       const url = URL.createObjectURL(blob);
       triggerDownload(url, result.pdf_filename || "filled_document.pdf");
       window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      if (warnings.length > 0) {
+        setDownloadWarning(
+          "Downloaded, but these fields were left blank because their values do not fit: " +
+            warnings.join(" ")
+        );
+      }
     } catch (error) {
       setDownloadError(
         error instanceof Error ? error.message : "Could not prepare the editable PDF.",
@@ -1281,8 +1289,9 @@ function WorkflowResultScreen({
     }
     setDownloading("normal");
     setDownloadError("");
+    setDownloadWarning("");
     try {
-      const blob = await finalizeReviewedPdf({
+      const { blob, warnings } = await finalizeReviewedPdf({
         pdfBase64,
         fields,
         values,
@@ -1293,6 +1302,12 @@ function WorkflowResultScreen({
       const url = URL.createObjectURL(blob);
       triggerDownload(url, `normal_${result.pdf_filename || file?.name || "filled_document.pdf"}`);
       window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      if (warnings.length > 0) {
+        setDownloadWarning(
+          "Downloaded, but these fields were left blank because their values do not fit: " +
+            warnings.join(" ")
+        );
+      }
     } catch (error) {
       setDownloadError(
         error instanceof Error ? error.message : "Could not download the normal PDF.",
@@ -1395,6 +1410,13 @@ function WorkflowResultScreen({
       {downloadError && (
         <div className="border-b border-destructive/20 bg-destructive/5 px-5 py-2 text-sm text-destructive">
           {downloadError}
+        </div>
+      )}
+
+      {downloadWarning && (
+        <div className="flex items-start gap-2 border-b border-amber-300 bg-amber-50 px-5 py-2 text-sm text-amber-950">
+          <AlertTriangle size={17} className="mt-0.5 shrink-0" />
+          <span>{downloadWarning}</span>
         </div>
       )}
 
