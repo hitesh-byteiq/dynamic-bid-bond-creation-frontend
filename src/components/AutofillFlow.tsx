@@ -46,7 +46,7 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import { FilledPdfPreview } from "@/components/FilledPdfPreview";
 import {
-  flattenPdf,
+  finalizeReviewedPdf,
   runWorkflow,
   toReviewFields,
   type PdfType,
@@ -54,7 +54,6 @@ import {
   type WorkflowResponse,
 } from "@/lib/workflow-api";
 import { useFieldValues } from "@/lib/use-field-values";
-import { buildAcroFormPdf } from "@/lib/pdf-form-values";
 import {
   addSchemaField,
   availableCandidates,
@@ -1227,6 +1226,12 @@ function WorkflowResultScreen({
   const mappedCount = fields.filter(
     (field) => (values[field.field_id] ?? field.mapped_value ?? "") !== "",
   ).length;
+  const prefilledTemplateFields = (result.template_fields ?? []).filter(
+    (field) => field.field_state === "PRE_FILLED",
+  );
+  const requiredTemplateFields = (result.template_fields ?? []).filter(
+    (field) => field.field_state === "REQUIRES_INPUT",
+  );
   const reviewCount = result.unresolved_fields.length;
   const completed = result.status === "completed" && reviewCount === 0;
   const [downloading, setDownloading] = useState<PdfType | null>(null);
@@ -1249,7 +1254,14 @@ function WorkflowResultScreen({
     setDownloadError("");
     setDownloading("acroform");
     try {
-      const blob = await buildAcroFormPdf(pdfBase64, fields, values);
+      const blob = await finalizeReviewedPdf({
+        pdfBase64,
+        fields,
+        values,
+        pdfType: "acroform",
+        filename: result.pdf_filename || file?.name || "filled_document.pdf",
+        compositeWidgetNames: result.composite_widget_names,
+      });
       const url = URL.createObjectURL(blob);
       triggerDownload(url, result.pdf_filename || "filled_document.pdf");
       window.setTimeout(() => URL.revokeObjectURL(url), 1000);
@@ -1270,15 +1282,15 @@ function WorkflowResultScreen({
     setDownloading("normal");
     setDownloadError("");
     try {
-      // Build an editable PDF from the latest review values, then flatten it.
-      // This avoids re-running the AI workflow and preserves edits made on the
-      // result screen.
-      const filledBlob = await buildAcroFormPdf(pdfBase64, fields, values);
-      const flatBlob = await flattenPdf(
-        filledBlob,
-        result.pdf_filename || file?.name || "filled_document.pdf",
-      );
-      const url = URL.createObjectURL(flatBlob);
+      const blob = await finalizeReviewedPdf({
+        pdfBase64,
+        fields,
+        values,
+        pdfType: "normal",
+        filename: result.pdf_filename || file?.name || "filled_document.pdf",
+        compositeWidgetNames: result.composite_widget_names,
+      });
+      const url = URL.createObjectURL(blob);
       triggerDownload(url, `normal_${result.pdf_filename || file?.name || "filled_document.pdf"}`);
       window.setTimeout(() => URL.revokeObjectURL(url), 1000);
     } catch (error) {
@@ -1497,6 +1509,33 @@ function WorkflowResultScreen({
               {mappedCount} / {fields.length} mapped
             </span>
           </div>
+          {(prefilledTemplateFields.length > 0 || requiredTemplateFields.length > 0) && (
+            <div className="mb-4 space-y-3 rounded-xl border bg-muted/30 p-3 text-sm">
+              {prefilledTemplateFields.length > 0 && (
+                <section>
+                  <h3 className="font-semibold text-success">Existing template values preserved</h3>
+                  <ul className="mt-1 space-y-1 text-xs text-muted-foreground">
+                    {prefilledTemplateFields.map((field) => (
+                      <li key={field.field_id}>
+                        <span className="font-medium text-foreground">{field.label}</span>
+                        {field.existing_value ? ` · ${field.existing_value}` : ""}
+                      </li>
+                    ))}
+                  </ul>
+                </section>
+              )}
+              {requiredTemplateFields.length > 0 && (
+                <section>
+                  <h3 className="font-semibold text-amber-700">Needs input or review</h3>
+                  <ul className="mt-1 space-y-1 text-xs text-muted-foreground">
+                    {requiredTemplateFields.map((field) => (
+                      <li key={field.field_id}>{field.label}</li>
+                    ))}
+                  </ul>
+                </section>
+              )}
+            </div>
+          )}
           <div className="space-y-2">
             {fields.map((field) => {
               const currentValue = values[field.field_id] ?? field.mapped_value ?? "";

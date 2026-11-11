@@ -14,6 +14,15 @@ export type WorkflowResponse = {
   pdf_filename: string;
   error: string;
   detected_fields: Array<Record<string, unknown>>;
+  template_fields?: Array<{
+    field_id: string;
+    label: string;
+    field_state: "PRE_FILLED" | "EMPTY" | "REQUIRES_INPUT" | string;
+    existing_value?: string | null;
+    rect?: number[] | null;
+    safe_rect?: number[] | null;
+    review_reason?: string | null;
+  }>;
   mapped_fields: Array<Record<string, unknown>>;
   unresolved_fields: Array<Record<string, unknown>>;
   /** field_id -> AcroForm widget name, produced by the S4 fill stage. */
@@ -27,6 +36,73 @@ export type WorkflowResponse = {
 
 function apiBaseUrl() {
   return String(import.meta.env.VITE_API_BASE_URL || "http://localhost:8000").replace(/\/$/, "");
+}
+
+function base64ToPdfBlob(base64: string): Blob {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return new Blob([bytes], { type: "application/pdf" });
+}
+
+/** Apply the current review values and return the requested PDF format. */
+export async function finalizeReviewedPdf({
+  pdfBase64,
+  fields,
+  values,
+  pdfType,
+  filename,
+  compositeWidgetNames = {},
+}: {
+  pdfBase64: string;
+  fields: AutofillField[];
+  values: Record<string, string>;
+  pdfType: PdfType;
+  filename: string;
+  compositeWidgetNames?: Record<string, string[]>;
+}): Promise<Blob> {
+  const fieldPayload = fields.map((field) => {
+    const names = compositeWidgetNames[field.field_id] ?? [];
+    const componentWidgetNames: Record<string, string> = {};
+    field.date_targets?.forEach((target, index) => {
+      const component = target.component;
+      const name = names[index];
+      if (component && name) componentWidgetNames[component] = name;
+    });
+    return {
+      field_id: field.field_id,
+      label: field.label,
+      field_type: field.field_type,
+      blank_style: field.blank_style ?? "",
+      widget_name: field.widget_name || field.field_name || field.field_id,
+      component_widget_names: componentWidgetNames,
+      value: values[field.field_id] ?? field.mapped_value ?? "",
+    };
+  });
+  const formData = new FormData();
+  formData.append("file", base64ToPdfBlob(pdfBase64), filename || "filled_document.pdf");
+  formData.append("fields", JSON.stringify(fieldPayload));
+  formData.append("pdf_type", pdfType);
+
+  const response = await fetch(`${apiBaseUrl()}/api/pdf/finalize`, {
+    method: "POST",
+    body: formData,
+    headers: { Accept: "application/pdf" },
+  });
+  if (!response.ok) {
+    const body = await response.text();
+    let detail = body;
+    try {
+      const parsed: unknown = JSON.parse(body);
+      if (isRecord(parsed) && typeof parsed["detail"] === "string") detail = parsed["detail"];
+    } catch {
+      // Keep the response body as a readable HTTP error.
+    }
+    throw new Error(detail || `PDF finalization failed (HTTP ${response.status}).`);
+  }
+  return response.blob();
 }
 
 export async function runWorkflow(
@@ -104,14 +180,7 @@ export async function runWorkflow(
   return finalResult;
 }
 
-/**
- * Flatten an already-filled AcroForm PDF into normal (non-fillable) page content.
- *
- * This only runs PyMuPDF flattening on the backend. The caller is responsible
- * for writing the latest review values into the AcroForm first (see
- * `buildAcroFormPdf`), so the flattened result matches the values shown on
- * the review screen.
- */
+/** Compatibility helper for callers that already have a filled AcroForm PDF. */
 export async function flattenPdf(filledPdf: Blob, filename?: string): Promise<Blob> {
   const formData = new FormData();
   formData.append("file", filledPdf, filename || "filled_document.pdf");
@@ -136,12 +205,7 @@ export async function flattenPdf(filledPdf: Blob, filename?: string): Promise<Bl
   return response.blob();
 }
 
-/**
- * Legacy endpoint that re-runs the workflow before returning a PDF.
- *
- * Prefer `buildAcroFormPdf` + `flattenPdf` so review edits are preserved and
- * no second AI run is triggered.
- */
+/** Legacy endpoint that reruns the workflow before returning a PDF. */
 export async function downloadFilledPdf({
   file,
   sourceText,
@@ -191,6 +255,9 @@ export function toReviewFields(result: WorkflowResponse): AutofillField[] {
     const unresolvedField = unresolved.get(id);
     const rect = isRect(detected["safe_rect"]) ? detected["safe_rect"] : detected["rect"];
     if (!id || !isRect(rect)) return [];
+    const compositeNames = result.composite_widget_names?.[id] ?? [];
+    const dayWidgetName = compositeNames.find((name) => name.endsWith("__day"));
+    const compositeBaseName = dayWidgetName?.slice(0, -"__day".length);
     const value = mapping?.["value"];
     const textValue = value === null || value === undefined ? null : String(value);
     const finalStatus = mapping?.["final_status"];
@@ -216,6 +283,7 @@ export function toReviewFields(result: WorkflowResponse): AutofillField[] {
         field_name: typeof detected["field_name"] === "string" ? detected["field_name"] : null,
         widget_name:
           widgetNames[id] ??
+          compositeBaseName ??
           (typeof detected["field_name"] === "string" ? detected["field_name"] : null),
         blank_style: typeof detected["blank_style"] === "string" ? detected["blank_style"] : null,
         ...(Array.isArray(detected["date_targets"])
