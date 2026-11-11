@@ -1,6 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import type { PDFDocumentProxy } from "pdfjs-dist";
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import type { PDFDocumentProxy, PDFPageProxy } from "pdfjs-dist";
+import "@/styles/pdf-annotation.css";
 import { fieldDisplayState, isPdfRect, type AutofillField } from "@/lib/autofill";
+import {
+  compositeDateParts,
+  isCheckedValue,
+  widgetNameFor,
+  type CompositeDateParts,
+} from "@/lib/pdf-form-values";
 import { projectPdfRect, type ProjectedRect } from "@/lib/pdf-overlay";
 
 type PageInfo = {
@@ -12,14 +19,35 @@ type PageInfo = {
 
 type Props = {
   pdfUrl: string;
-  pages: PageInfo[];
   fields: AutofillField[];
-  showBoxes: boolean;
+  /** Live review values keyed by `field_id`. */
+  values?: Record<string, string>;
+  onValueChange?: ((fieldId: string, value: string) => void) | undefined;
   selectedFieldId: string | null;
   onSelectField: (fieldId: string) => void;
   page: number;
   scale: number;
+  /** Opt-in debugging boxes. Off by default so the panel reads as a PDF viewer. */
+  showHighlights?: boolean;
+  /** Legacy prop kept for the older (unused) result screen. */
+  showBoxes?: boolean;
+  /** Legacy page metadata; real dimensions now come from pdf.js. */
+  pages?: PageInfo[];
+  onPageCountChange?: ((pageCount: number) => void) | undefined;
 };
+
+type PageOverlay = {
+  field: AutofillField;
+  rect: ProjectedRect;
+  thin: boolean;
+};
+
+type WidgetBinding = {
+  field: AutofillField;
+  component?: keyof CompositeDateParts;
+};
+
+type FormElement = HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
 
 let pdfJsPromise: Promise<typeof import("pdfjs-dist")> | null = null;
 
@@ -55,30 +83,127 @@ function boxTone(field: AutofillField, selected: boolean) {
   return "border-warning";
 }
 
-type PageOverlay = { field: AutofillField; rect: ProjectedRect; thin: boolean };
+function isCheckboxElement(element: FormElement) {
+  return (
+    element instanceof HTMLInputElement && (element.type === "checkbox" || element.type === "radio")
+  );
+}
+
+function readElementValue(element: FormElement) {
+  if (isCheckboxElement(element)) return (element as HTMLInputElement).checked ? "true" : "false";
+  return element.value;
+}
+
+function setElementValue(element: FormElement, value: string) {
+  if (isCheckboxElement(element)) {
+    const checked = isCheckedValue(value);
+    if ((element as HTMLInputElement).checked !== checked) {
+      (element as HTMLInputElement).checked = checked;
+    }
+    return;
+  }
+  if (element.value !== value) element.value = value;
+}
+
+function valueForBinding(binding: WidgetBinding, values: Record<string, string>) {
+  const raw = values[binding.field.field_id] ?? binding.field.mapped_value ?? "";
+  if (!binding.component) return raw;
+  return compositeDateParts(raw)?.[binding.component] ?? "";
+}
+
+function buildWidgetBindings(fields: AutofillField[]) {
+  const bindings = new Map<string, WidgetBinding>();
+  for (const field of fields) {
+    const baseName = widgetNameFor(field);
+    bindings.set(baseName, { field });
+    if (field.field_name) bindings.set(field.field_name, { field });
+    bindings.set(field.field_id, { field });
+
+    if (field.blank_style === "composite_date") {
+      for (const target of field.date_targets ?? []) {
+        const component = target.component as keyof CompositeDateParts | undefined;
+        if (component) bindings.set(`${baseName}__${component}`, { field, component });
+      }
+    }
+  }
+  return bindings;
+}
+
+function bindFormWidgets({
+  container,
+  annotations,
+  fields,
+  values,
+  onValueChange,
+  onSelectField,
+}: {
+  container: HTMLDivElement;
+  annotations: Array<Record<string, unknown>>;
+  fields: AutofillField[];
+  values: Record<string, string>;
+  onValueChange?: ((fieldId: string, value: string) => void) | undefined;
+  onSelectField: (fieldId: string) => void;
+}) {
+  const bindings = buildWidgetBindings(fields);
+  const bound = new Map<FormElement, WidgetBinding>();
+  const sections = container.querySelectorAll<HTMLElement>("section[data-annotation-id]");
+
+  for (const section of sections) {
+    const annotationId = section.getAttribute("data-annotation-id");
+    const annotation = annotations.find((item) => String(item["id"]) === annotationId);
+    const fieldName = typeof annotation?.["fieldName"] === "string" ? annotation["fieldName"] : "";
+    const binding = bindings.get(fieldName);
+    if (!binding) continue;
+    const element = section.querySelector<FormElement>("input, textarea, select");
+    if (!element) continue;
+
+    element.dataset["fieldId"] = binding.field.field_id;
+    setElementValue(element, valueForBinding(binding, values));
+    bound.set(element, binding);
+
+    const handleChange = () => {
+      if (binding.component) return; // composite widgets are edited through the card
+      onValueChange?.(binding.field.field_id, readElementValue(element));
+    };
+    element.addEventListener("input", handleChange);
+    element.addEventListener("change", handleChange);
+    element.addEventListener("focus", () => onSelectField(binding.field.field_id));
+  }
+
+  return bound;
+}
 
 function PdfPage({
   pdf,
   page,
   pageCount,
   fields,
+  values,
+  onValueChange,
   selectedFieldId,
   onSelectField,
-  showBoxes,
+  showHighlights,
   scale,
 }: {
   pdf: PDFDocumentProxy;
-  page: PageInfo;
+  page: number;
   pageCount: number;
   fields: AutofillField[];
+  values: Record<string, string>;
+  onValueChange?: ((fieldId: string, value: string) => void) | undefined;
   selectedFieldId: string | null;
   onSelectField: (fieldId: string) => void;
-  showBoxes: boolean;
+  showHighlights: boolean;
   scale: number;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const annotationRef = useRef<HTMLDivElement>(null);
+  const widgetBindingsRef = useRef<Map<FormElement, WidgetBinding>>(new Map());
+  const valuesRef = useRef(values);
+  valuesRef.current = values;
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [widgetFieldIds, setWidgetFieldIds] = useState<Set<string>>(() => new Set());
   const [layout, setLayout] = useState<{
     width: number;
     height: number;
@@ -88,13 +213,17 @@ function PdfPage({
   useEffect(() => {
     let cancelled = false;
     let renderTask: { cancel: () => void } | null = null;
+    let annotationLayer: { destroy: () => void } | null = null;
     setReady(false);
     setError(null);
     setLayout(null);
+    setWidgetFieldIds(new Set());
+    widgetBindingsRef.current = new Map();
 
     const render = async () => {
       try {
-        const pdfPage = await pdf.getPage(page.page);
+        const pdfjs = await loadPdfJs();
+        const pdfPage = await pdf.getPage(page);
         if (cancelled) return;
         const canvas = canvasRef.current;
         const context = canvas?.getContext("2d");
@@ -108,9 +237,10 @@ function PdfPage({
 
         const pageView = isPdfRect(pdfPage.view)
           ? pdfPage.view
-          : ([0, 0, page.width, page.height] as const);
+          : ([0, 0, displayViewport.width, displayViewport.height] as const);
+
         const overlays = fields.flatMap((field): PageOverlay[] => {
-          if (field.page !== page.page) return [];
+          if (field.page !== page) return [];
           const boxes =
             field.placement_status === "written" && field.write_rects?.length
               ? field.write_rects
@@ -120,15 +250,14 @@ function PdfPage({
           return boxes.flatMap((box) => {
             if (!isPdfRect(box)) return [];
             const rect = projectPdfRect(box, [...pageView], renderViewport);
-            return rect
-              ? [
-                  {
-                    field,
-                    rect,
-                    thin: field.placement_status !== "written" && box[3] - box[1] <= 2,
-                  },
-                ]
-              : [];
+            if (!rect) return [];
+            return [
+              {
+                field,
+                rect,
+                thin: field.placement_status !== "written" && box[3] - box[1] <= 2,
+              },
+            ];
           });
         });
 
@@ -136,13 +265,72 @@ function PdfPage({
           canvas,
           canvasContext: context,
           viewport: renderViewport,
+          // Forms are drawn by the AnnotationLayer as HTML, not baked into the raster.
+          annotationMode: pdfjs.AnnotationMode.ENABLE_FORMS,
         });
         renderTask = task;
         await task.promise;
-        if (!cancelled) {
-          setLayout({ width: displayViewport.width, height: displayViewport.height, overlays });
-          setReady(true);
+        if (cancelled) return;
+
+        // Render real AcroForm widgets (the browser PDF viewer experience)
+        // instead of only painting the page raster.
+        let widgetIds = new Set<string>();
+        const annotationDiv = annotationRef.current;
+        if (annotationDiv) {
+          annotationDiv.replaceChildren();
+          try {
+            const annotations = (await pdfPage.getAnnotations({
+              intent: "display",
+            })) as Array<Record<string, unknown>>;
+            if (cancelled) return;
+
+            const Layer = pdfjs.AnnotationLayer as unknown as new (params: {
+              div: HTMLDivElement;
+              page: PDFPageProxy;
+              viewport: ReturnType<PDFPageProxy["getViewport"]>;
+              linkService: unknown;
+            }) => {
+              render: (params: Record<string, unknown>) => Promise<void>;
+              destroy: () => void;
+            };
+
+            const layer = new Layer({
+              div: annotationDiv,
+              page: pdfPage,
+              viewport: displayViewport,
+              linkService: createLinkServiceStub(),
+            });
+            annotationLayer = layer;
+            await layer.render({
+              viewport: displayViewport,
+              div: annotationDiv,
+              annotations,
+              page: pdfPage,
+              linkService: createLinkServiceStub(),
+              renderForms: true,
+            });
+            if (cancelled) return;
+
+            widgetBindingsRef.current = bindFormWidgets({
+              container: annotationDiv,
+              annotations,
+              fields,
+              values: valuesRef.current,
+              onValueChange,
+              onSelectField,
+            });
+            widgetIds = new Set(
+              [...widgetBindingsRef.current.values()].map((binding) => binding.field.field_id),
+            );
+          } catch (annotationError) {
+            // A PDF without form widgets (or with unsupported XFA) is still usable.
+            console.warn("PDF form widgets could not be rendered.", annotationError);
+          }
         }
+
+        setLayout({ width: displayViewport.width, height: displayViewport.height, overlays });
+        setWidgetFieldIds(widgetIds);
+        setReady(true);
       } catch (renderError) {
         if (!cancelled) {
           setError(
@@ -155,22 +343,38 @@ function PdfPage({
     return () => {
       cancelled = true;
       renderTask?.cancel();
+      annotationLayer?.destroy();
     };
-  }, [pdf, page.page, page.width, page.height, fields, scale]);
+  }, [pdf, page, scale, fields, onValueChange, onSelectField]);
 
-  const pageWidth = page.width > 0 ? page.width : 612;
-  const pageHeight = page.height > 0 ? page.height : 792;
+  // Keep already-rendered widgets in sync with card edits without reloading the PDF.
+  useEffect(() => {
+    for (const [element, binding] of widgetBindingsRef.current) {
+      setElementValue(element, valueForBinding(binding, values));
+    }
+  }, [values]);
+
+  const pageWidth = layout?.width ?? 612;
+  const pageHeight = layout?.height ?? 792;
+  const scaleVars = {
+    "--scale-factor": String(scale),
+    "--total-scale-factor": String(scale),
+    "--scale-round-x": "1px",
+    "--scale-round-y": "1px",
+  } as CSSProperties;
+
   return (
-    <div className="mx-auto shrink-0" style={{ width: layout?.width ?? pageWidth * scale }}>
+    <div className="mx-auto shrink-0" style={{ width: pageWidth }}>
       <div
         className="relative overflow-hidden rounded-xl border border-border bg-white shadow-xl shadow-ink/10"
-        style={{ height: layout?.height ?? pageHeight * scale }}
+        style={{ height: pageHeight, ...scaleVars }}
       >
         <canvas
           ref={canvasRef}
           className={`block h-full w-full ${ready ? "" : "invisible"}`}
-          aria-label={`Page ${page.page}`}
+          aria-label={`Page ${page}`}
         />
+        <div ref={annotationRef} className="annotationLayer" />
         {error && (
           <p className="absolute inset-0 flex items-center justify-center p-4 text-center text-sm text-destructive">
             {error}
@@ -178,50 +382,75 @@ function PdfPage({
         )}
         {!ready && !error && (
           <p className="absolute inset-0 flex items-center justify-center text-sm text-muted-foreground">
-            Rendering page {page.page}…
+            Rendering page {page}…
           </p>
         )}
-        {ready && showBoxes && layout && (
-          <div className="absolute inset-0">
+        {ready && layout && (
+          <div className="pointer-events-none absolute inset-0">
             {layout.overlays.map(({ field, rect, thin }, index) => {
               const selected = selectedFieldId === field.field_id;
-              const value = readableValue(field.written_value ?? field.mapped_value);
+              const hasWidget = widgetFieldIds.has(field.field_id);
+              const value = readableValue(values[field.field_id] ?? field.mapped_value);
+              const checkbox = field.field_type.toLowerCase().includes("checkbox");
               const title = value ? `${field.label}: ${value}` : field.label;
+              const pxHeight = (layout.height * rect.height) / 100;
+              const fontSize = Math.max(7, Math.min(20, pxHeight * 0.62 || 11));
 
               return (
                 <div key={`${field.field_id}-${index}`} className="contents">
-                  <span
-                    aria-hidden="true"
-                    className={`pointer-events-none absolute rounded-[2px] ${thin ? "border-t-2" : "border"} ${boxTone(field, selected)}`}
-                    style={{
-                      left: `${rect.left}%`,
-                      top: `${rect.top}%`,
-                      width: `${rect.width}%`,
-                      height: thin ? 0 : `${rect.height}%`,
-                    }}
-                  />
-                  <button
-                    type="button"
-                    title={title}
-                    aria-label={title}
-                    aria-pressed={selected}
-                    onClick={() => onSelectField(field.field_id)}
-                    className="group absolute cursor-pointer"
-                    style={{
-                      left: `${rect.left}%`,
-                      top: thin ? `calc(${rect.top}% - 10px)` : `${rect.top}%`,
-                      width: `max(${rect.width}%, 20px)`,
-                      height: thin ? "20px" : `max(${rect.height}%, 20px)`,
-                    }}
-                  >
-                    <span className="sr-only">{field.label}</span>
-                    {selected && (
-                      <span className="pointer-events-none absolute -top-7 left-0 z-10 max-w-[240px] truncate rounded-md bg-ink px-2 py-1 text-[10px] font-semibold text-primary-foreground shadow-lg">
-                        {field.label}
-                        {value ? ` · ${value}` : ""}
-                      </span>
-                    )}
-                  </button>
+                  {(showHighlights || selected) && (
+                    <span
+                      aria-hidden="true"
+                      className={`pointer-events-none absolute rounded-[2px] ${thin ? "border-t-2" : "border"} ${boxTone(field, selected)}`}
+                      style={{
+                        left: `${rect.left}%`,
+                        top: `${rect.top}%`,
+                        width: `${rect.width}%`,
+                        height: thin ? 0 : `${rect.height}%`,
+                      }}
+                    />
+                  )}
+                  {!hasWidget && value !== "" && (
+                    <span
+                      aria-hidden="true"
+                      className="pointer-events-none absolute flex items-center overflow-hidden whitespace-nowrap font-medium text-ink"
+                      style={{
+                        left: `${rect.left}%`,
+                        top: `${rect.top}%`,
+                        width: `max(${rect.width}%, 20px)`,
+                        height: thin ? "auto" : `${rect.height}%`,
+                        fontSize,
+                        lineHeight: 1,
+                        paddingLeft: 1,
+                      }}
+                    >
+                      {checkbox ? (isCheckedValue(value) ? "✓" : "") : value}
+                    </span>
+                  )}
+                  {!hasWidget && (
+                    <button
+                      type="button"
+                      title={title}
+                      aria-label={title}
+                      aria-pressed={selected}
+                      onClick={() => onSelectField(field.field_id)}
+                      className="pointer-events-auto group absolute cursor-pointer"
+                      style={{
+                        left: `${rect.left}%`,
+                        top: thin ? `calc(${rect.top}% - 10px)` : `${rect.top}%`,
+                        width: `max(${rect.width}%, 20px)`,
+                        height: thin ? "20px" : `max(${rect.height}%, 20px)`,
+                      }}
+                    >
+                      <span className="sr-only">{field.label}</span>
+                      {selected && (
+                        <span className="pointer-events-none absolute -top-7 left-0 z-10 max-w-[240px] truncate rounded-md bg-ink px-2 py-1 text-[10px] font-semibold text-primary-foreground shadow-lg">
+                          {field.label}
+                          {value ? ` · ${value}` : ""}
+                        </span>
+                      )}
+                    </button>
+                  )}
                 </div>
               );
             })}
@@ -229,24 +458,44 @@ function PdfPage({
         )}
       </div>
       <p className="mt-2 text-center text-[11px] font-semibold text-muted-foreground">
-        Page {page.page} of {pageCount}
+        Page {page} of {pageCount}
       </p>
     </div>
   );
 }
 
+function createLinkServiceStub() {
+  return {
+    getDestinationHash: () => "",
+    getAnchorUrl: () => "#",
+    navigateTo: () => undefined,
+    addLinkAttributes: (link: HTMLAnchorElement) => {
+      link.target = "_blank";
+      link.rel = "noopener noreferrer nofollow";
+    },
+    externalLinkTarget: 0,
+    externalLinkRel: "noopener noreferrer nofollow",
+    externalLinkEnabled: false,
+    isInPresentationMode: false,
+  };
+}
+
 export function FilledPdfPreview({
   pdfUrl,
-  pages,
   fields,
-  showBoxes,
+  values = {},
+  onValueChange,
   selectedFieldId,
   onSelectField,
   page,
   scale,
+  showHighlights,
+  showBoxes,
+  onPageCountChange,
 }: Props) {
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const highlights = showHighlights ?? showBoxes ?? false;
 
   useEffect(() => {
     let cancelled = false;
@@ -279,16 +528,11 @@ export function FilledPdfPreview({
     };
   }, [pdfUrl]);
 
-  const normalizedPages = useMemo(() => {
-    if (pages.length > 0) return pages;
-    if (!pdf) return [];
-    return Array.from({ length: pdf.numPages }, (_, index) => ({
-      page: index + 1,
-      width: 612,
-      height: 792,
-      rotation: 0,
-    }));
-  }, [pages, pdf]);
+  useEffect(() => {
+    if (pdf) onPageCountChange?.(pdf.numPages);
+  }, [pdf, onPageCountChange]);
+
+  const pageCount = useMemo(() => (pdf ? pdf.numPages : 0), [pdf]);
 
   if (error) {
     return (
@@ -318,27 +562,24 @@ export function FilledPdfPreview({
     );
   }
 
-  const pageCount = normalizedPages.length;
-  const activePage = Math.min(Math.max(page, 1), pageCount);
-  const activePageInfo =
-    normalizedPages.find((pageInfo) => pageInfo.page === activePage) ?? normalizedPages[0];
+  const activePage = Math.min(Math.max(page, 1), Math.max(pageCount, 1));
 
   return (
     <div className="min-h-0 flex-1 overflow-auto bg-[#F7F8FB]">
       <div className="flex min-h-full w-max min-w-full justify-center p-4">
-        {activePageInfo && (
-          <PdfPage
-            key={activePageInfo.page}
-            pdf={pdf}
-            page={activePageInfo}
-            pageCount={pageCount}
-            fields={fields}
-            selectedFieldId={selectedFieldId}
-            onSelectField={onSelectField}
-            showBoxes={showBoxes}
-            scale={scale}
-          />
-        )}
+        <PdfPage
+          key={activePage}
+          pdf={pdf}
+          page={activePage}
+          pageCount={pageCount}
+          fields={fields}
+          values={values}
+          onValueChange={onValueChange}
+          selectedFieldId={selectedFieldId}
+          onSelectField={onSelectField}
+          showHighlights={highlights}
+          scale={scale}
+        />
       </div>
     </div>
   );

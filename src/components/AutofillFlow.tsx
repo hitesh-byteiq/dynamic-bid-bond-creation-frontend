@@ -6,6 +6,7 @@ import {
   Brain,
   Braces,
   Check,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   Download,
@@ -18,6 +19,8 @@ import {
   Loader2,
   Minus,
   Plus,
+  ZoomIn,
+  ZoomOut,
   Save,
   Sparkles,
   Upload,
@@ -32,9 +35,25 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Textarea } from "@/components/ui/textarea";
 import { FilledPdfPreview } from "@/components/FilledPdfPreview";
-import { RunTraceDialog } from "@/components/AutofillTraceDialogs";
+import {
+  finalizeReviewedPdf,
+  runWorkflow,
+  toReviewFields,
+  type PdfType,
+  type WorkflowEvent,
+  type WorkflowResponse,
+} from "@/lib/workflow-api";
+import { useFieldValues } from "@/lib/use-field-values";
 import {
   addSchemaField,
   availableCandidates,
@@ -51,10 +70,6 @@ import {
   type ReviewStatus,
 } from "@/lib/review";
 import {
-  isAutofillFailure,
-  isAutofillResponse,
-  isFinalizeResponse,
-  isSchemaReviewResponse,
   type AutofillFailure,
   type AutofillField,
   type AutofillResponse,
@@ -64,13 +79,6 @@ import {
 
 const MAX_PDF_BYTES = 20 * 1024 * 1024;
 const MAX_RAW_TEXT_CHARS = 100_000;
-const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "http://localhost:8000").replace(
-  /\/$/,
-  "",
-);
-
-type WorkflowStage = "landing" | "source" | "schema" | "result";
-
 function createPdfBlob(base64: string, mimeType: string) {
   const binary = atob(base64);
   if (!binary.startsWith("%PDF")) throw new Error("The response is not a PDF.");
@@ -89,40 +97,19 @@ function readableValue(value: unknown) {
   return JSON.stringify(value);
 }
 
-function userFacingError(status: number, payload: unknown) {
-  if (status === 400) {
-    if (typeof payload === "object" && payload !== null && "detail" in payload) {
-      const detail = (payload as { detail?: unknown }).detail;
-      if (typeof detail === "string" && detail.trim()) return detail;
-    }
-    return "Check that the PDF is readable and the source information is not empty.";
-  }
-  if (status === 413) return "The PDF or source information is larger than the allowed limit.";
-  if (status === 422) {
-    return "This PDF could not be filled. Use an unlocked, text-based PDF with one to three pages.";
-  }
-  if (status === 502) return "Autofill could not complete right now. Please try again shortly.";
-  if (status === 503)
-    return "Autofill is temporarily unavailable. Please contact your administrator.";
-  if (status >= 500) return "Something went wrong while completing the form. Please try again.";
-  return "The request could not be completed. Check your information and try again.";
-}
-
 export function AutofillFlow() {
-  const [stage, setStage] = useState<WorkflowStage>("landing");
+  const [stage, setStage] = useState<"landing" | "source" | "result">("landing");
   const [file, setFile] = useState<File | null>(null);
   const [rawText, setRawText] = useState("");
+  const [instructions, setInstructions] = useState("");
+  const [liveEvents, setLiveEvents] = useState<WorkflowEvent[]>([]);
   const [inputError, setInputError] = useState("");
   const [requestError, setRequestError] = useState("");
   const [busy, setBusy] = useState(false);
   const [responseViewerOpen, setResponseViewerOpen] = useState(false);
-  const [runTraceOpen, setRunTraceOpen] = useState(false);
-  const [failure, setFailure] = useState<AutofillFailure | null>(null);
   const [apiResponse, setApiResponse] = useState<unknown>(null);
   const [hasApiResponse, setHasApiResponse] = useState(false);
-  const [result, setResult] = useState<AutofillResponse | null>(null);
-  const [schemaReview, setSchemaReview] = useState<SchemaReviewResponse | null>(null);
-  const [schemaDraft, setSchemaDraft] = useState<SchemaDraft | null>(null);
+  const [result, setResult] = useState<WorkflowResponse | null>(null);
   const [pdfUrl, setPdfUrl] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -144,8 +131,8 @@ export function AutofillFlow() {
     setApiResponse(null);
     setHasApiResponse(false);
     setResult(null);
-    setFailure(null);
     setPdfUrl(null);
+    setLiveEvents([]);
     if (!selected) {
       setFile(null);
       return;
@@ -181,157 +168,33 @@ export function AutofillFlow() {
     setApiResponse(null);
     setHasApiResponse(false);
     setResult(null);
-    setFailure(null);
     setPdfUrl(null);
 
     const formData = new FormData();
     formData.append("file", file, file.name);
-    formData.append("raw_text", rawText);
+    formData.append("source_text", rawText);
+    if (instructions.trim()) formData.append("instructions", instructions.trim());
 
     try {
-      const response = await fetch(`${API_BASE_URL}/api/autofill`, {
-        method: "POST",
-        body: formData,
+      const payload = await runWorkflow(formData, (event) => {
+        setLiveEvents((events) => [...events.slice(-19), event]);
+        setApiResponse({ event: event.event, ...event.data });
+        setHasApiResponse(true);
       });
-      const responseText = await response.text();
-      let payload: unknown = responseText;
-      try {
-        payload = responseText ? JSON.parse(responseText) : null;
-      } catch {
-        // Keep a non-JSON error body available only in the explicit response viewer.
-      }
       setApiResponse(payload);
       setHasApiResponse(true);
-
-      if (!response.ok) {
-        if (isAutofillFailure(payload)) setFailure(payload);
-        setRequestError(userFacingError(response.status, payload));
-        return;
+      if (payload.status === "failed") {
+        setRequestError(payload.error || "The workflow failed. Review the trace and try again.");
       }
-      if (isSchemaReviewResponse(payload)) {
-        setSchemaReview(payload);
-        setSchemaDraft(payload.schema as SchemaDraft);
-        setStage("schema");
-        return;
-      }
-      if (!isAutofillResponse(payload)) {
-        setRequestError("Autofill returned an unexpected response. Please try again.");
-        return;
-      }
-
-      let outputBlob: Blob;
-      try {
-        outputBlob = createPdfBlob(payload.pdf_base64, payload.pdf_mime_type);
-      } catch {
-        setRequestError(
-          "Autofill returned an unreadable PDF. Please try again or view the response.",
-        );
-        return;
+      if (payload.pdf_base64) {
+        const outputBlob = createPdfBlob(payload.pdf_base64, "application/pdf");
+        setPdfUrl(URL.createObjectURL(outputBlob));
       }
       setResult(payload);
-      setPdfUrl(URL.createObjectURL(outputBlob));
       setStage("result");
-    } catch {
-      setRequestError(
-        "Could not read a response from the autofill service. Check that the backend allows this website's origin, then try again.",
-      );
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const approveSchema = async () => {
-    if (!schemaReview || !schemaDraft) return;
-    setBusy(true);
-    setRequestError("");
-    try {
-      const update = await fetch(
-        `${API_BASE_URL}/api/v1/stage2/schemas/${schemaReview.template.schema_id}`,
-        {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(schemaDraft),
-        },
-      );
-      if (!update.ok) throw new Error("The template schema could not be saved.");
-      const review = await fetch(
-        `${API_BASE_URL}/api/v1/stage2/schemas/${schemaReview.template.schema_id}/review`,
-        {
-          method: "POST",
-        },
-      );
-      if (!review.ok) throw new Error("The template schema could not be approved.");
-      setSchemaReview(null);
-      setSchemaDraft(null);
-      setStage("source");
-      await runAutofill();
     } catch (error) {
-      setRequestError(error instanceof Error ? error.message : "The schema could not be saved.");
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const finalizeRun = async (decisions: FieldDecision[]) => {
-    if (!file || !result) return;
-    setBusy(true);
-    setRequestError("");
-    const formData = new FormData();
-    formData.append("file", file, file.name);
-    formData.append("raw_text", rawText);
-    formData.append("decisions", JSON.stringify({ run_id: result.run_id, decisions }));
-    try {
-      const response = await fetch(`${API_BASE_URL}/api/autofill/finalize`, {
-        method: "POST",
-        body: formData,
-      });
-      const payload: unknown = await response.json();
-      setApiResponse(payload);
-      setHasApiResponse(true);
-      if (!response.ok) {
-        const detail =
-          payload && typeof payload === "object" && "detail" in payload
-            ? String((payload as { detail: unknown }).detail)
-            : "The PDF could not be finalized.";
-        setRequestError(detail);
-        return;
-      }
-      if (!isFinalizeResponse(payload)) {
-        setRequestError("Finalization returned an unexpected response.");
-        return;
-      }
-      const outputBlob = createPdfBlob(payload.pdf_base64, payload.pdf_mime_type);
-      setPdfUrl(URL.createObjectURL(outputBlob));
-      setResult((current) =>
-        current
-          ? {
-              ...current,
-              status: payload.fields.every((field) => field.status === "filled")
-                ? "completed"
-                : "partial",
-              requires_approval: false,
-              output_filename: payload.output_filename,
-              fields: payload.fields,
-              summary: {
-                ...current.summary,
-                mapped: payload.fields.filter((field) => field.mapped_value).length,
-                filled: payload.fields.filter((field) => field.status === "filled").length,
-                skipped: payload.fields.filter((field) => field.status === "skipped").length,
-                review: payload.fields.filter((field) => field.mapping_status === "review").length,
-                missing: payload.fields.filter((field) => field.status === "missing").length,
-                overflow: payload.fields.filter((field) => field.placement_status === "overflow")
-                  .length,
-                manual: payload.fields.filter((field) => field.placement_status === "manual")
-                  .length,
-                verification_passed: payload.fields.filter(
-                  (field) => field.verification_status === "passed",
-                ).length,
-              },
-            }
-          : current,
-      );
-    } catch (error) {
-      setRequestError(error instanceof Error ? error.message : "The PDF could not be finalized.");
+      const message = error instanceof Error ? error.message : "Workflow request failed.";
+      setRequestError(`${message} Edit the source information and retry.`);
     } finally {
       setBusy(false);
     }
@@ -351,7 +214,6 @@ export function AutofillFlow() {
 
   const startNewDocument = () => {
     setResult(null);
-    setFailure(null);
     setPdfUrl(null);
     setApiResponse(null);
     setHasApiResponse(false);
@@ -359,6 +221,7 @@ export function AutofillFlow() {
     setInputError("");
     setFile(null);
     setRawText("");
+    setInstructions("");
     if (fileInputRef.current) fileInputRef.current.value = "";
     setStage("source");
   };
@@ -370,15 +233,7 @@ export function AutofillFlow() {
       ) : (
         <div className="flex h-screen flex-col">
           <AppHeader
-            activeStepIndex={
-              stage === "source"
-                ? 1
-                : stage === "schema"
-                  ? 2
-                  : result && result.status === "completed"
-                    ? 4
-                    : 3
-            }
+            activeStepIndex={stage === "source" ? 1 : result?.status === "completed" ? 4 : 3}
             onHome={() => setStage("landing")}
           />
           <div className="flex-1 min-h-0 overflow-hidden">
@@ -390,47 +245,29 @@ export function AutofillFlow() {
                 inputError={inputError}
                 onFileChange={(event) => chooseFile(event.target.files?.[0] ?? null)}
                 onRawTextChange={setRawText}
+                instructions={instructions}
+                onInstructionsChange={setInstructions}
+                liveEvents={liveEvents}
                 onSubmit={handleSourceSubmit}
                 rawText={rawText}
                 requestError={requestError}
                 hasApiResponse={hasApiResponse}
                 onViewResponse={() => setResponseViewerOpen(true)}
-                hasTrace={failure !== null}
-                onViewTrace={() => setRunTraceOpen(true)}
               />
-            ) : stage === "schema" && schemaReview && schemaDraft ? (
-              <SchemaReviewScreen
-                schema={schemaDraft}
-                setSchema={setSchemaDraft}
-                previewImages={schemaReview.preview_images}
-                trace={schemaReview.trace}
-                filename={schemaReview.filename}
-                busy={busy}
-                error={requestError}
-                onBack={() => setStage("source")}
-                onApprove={() => void approveSchema()}
-              />
-            ) : result && pdfUrl ? (
-              <ResultScreen
+            ) : result ? (
+              <WorkflowResultScreen
                 result={result}
                 pdfUrl={pdfUrl}
-                error={requestError}
+                pdfBase64={result.pdf_base64}
+                file={file}
+                sourceText={rawText}
+                instructions={instructions}
                 onEditSource={() => setStage("source")}
-                finalizing={busy}
-                onFinalize={(decisions) => void finalizeRun(decisions)}
               />
             ) : null}
           </div>
         </div>
       )}
-
-      <RunTraceDialog
-        open={runTraceOpen}
-        onOpenChange={setRunTraceOpen}
-        runId={result?.run_id ?? failure?.run_id ?? ""}
-        trace={result?.trace ?? failure?.trace ?? []}
-        failedStage={failure?.failed_stage ?? null}
-      />
 
       <Dialog open={responseViewerOpen} onOpenChange={setResponseViewerOpen}>
         <DialogContent className="flex max-h-[92vh] max-w-[min(96vw,900px)] flex-col rounded-2xl bg-white">
@@ -534,31 +371,61 @@ function WorkflowPill({
 
 function AnalysisLoadingCard({
   label = "Processing your PDF and source information…",
+  stageLabel = "Preparing workflow",
+  progress = 8,
 }: {
   label?: string;
+  stageLabel?: string;
+  progress?: number;
 }) {
   return (
     <div className="rounded-xl border border-border bg-cream/25 px-4 py-3" aria-busy="true">
-      <p
-        className="flex items-center gap-2 text-sm font-semibold text-foreground"
-        role="status"
-        aria-live="polite"
-      >
-        <Loader2 size={15} className="animate-spin text-primary" />
-        {label}
-      </p>
-      <div
-        className="mt-3 h-1.5 overflow-hidden rounded-full bg-cream"
-        role="progressbar"
-        aria-label="Autofill in progress"
-      >
-        <div className="h-full w-1/3 animate-pulse rounded-full bg-primary" />
+      <div className="flex items-start justify-between gap-3">
+        <p
+          className="flex items-center gap-2 text-sm font-semibold text-foreground"
+          role="status"
+          aria-live="polite"
+        >
+          <Loader2 size={15} className="mt-0.5 shrink-0 animate-spin text-primary" />
+          {label}
+        </p>
+        <span className="shrink-0 text-sm font-bold text-primary">{progress}%</span>
       </div>
-      <p className="mt-2 text-xs text-muted-foreground">
-        This can take several minutes. Keep this page open.
+      <div
+        className="mt-3 h-2 overflow-hidden rounded-full bg-cream"
+        role="progressbar"
+        aria-label="Autofill progress"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={progress}
+      >
+        <div
+          className="h-full rounded-full bg-primary transition-[width] duration-500"
+          style={{ width: `${progress}%` }}
+        />
+      </div>
+      <p className="mt-2 flex items-center justify-between gap-3 text-xs text-muted-foreground">
+        <span>{stageLabel}</span>
+        <span>Keep this page open</span>
       </p>
     </div>
   );
+}
+
+function loadingProgress(events: WorkflowEvent[]) {
+  const latestStart = [...events].reverse().find((event) => event.event === "tool_started");
+  const tool = String(latestStart?.data["tool"] ?? "");
+  const label = String(latestStart?.data["label"] ?? "Preparing the workflow…");
+  const stages: Record<string, { progress: number; stage: string }> = {
+    s1_detect_fields: { progress: 25, stage: "Stage 1 of 4 · Detect fields" },
+    s2_build_schema: { progress: 50, stage: "Stage 2 of 4 · Build schema" },
+    s3_map_values: { progress: 70, stage: "Stage 3 of 4 · Map values" },
+    guardian_validate: { progress: 78, stage: "Stage 3 of 4 · Validate values" },
+    repair_mapping: { progress: 70, stage: "Stage 3 of 4 · Repair mapping" },
+    s4_fill_pdf: { progress: 90, stage: "Stage 4 of 4 · Fill PDF" },
+    post_fill_check: { progress: 96, stage: "Stage 4 of 4 · Verify PDF" },
+  };
+  return { ...(stages[tool] ?? { progress: 8, stage: "Preparing workflow" }), label };
 }
 
 function LandingPage({ onStart }: { onStart: () => void }) {
@@ -1108,13 +975,14 @@ function SourceScreen({
   inputError,
   onFileChange,
   onRawTextChange,
+  instructions,
+  onInstructionsChange,
+  liveEvents,
   onSubmit,
   rawText,
   requestError,
   hasApiResponse,
   onViewResponse,
-  hasTrace,
-  onViewTrace,
 }: {
   busy: boolean;
   file: File | null;
@@ -1122,14 +990,16 @@ function SourceScreen({
   inputError: string;
   onFileChange: (event: React.ChangeEvent<HTMLInputElement>) => void;
   onRawTextChange: (value: string) => void;
+  instructions: string;
+  onInstructionsChange: (value: string) => void;
+  liveEvents: WorkflowEvent[];
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
   rawText: string;
   requestError: string;
   hasApiResponse: boolean;
   onViewResponse: () => void;
-  hasTrace: boolean;
-  onViewTrace: () => void;
 }) {
+  const currentProgress = loadingProgress(liveEvents);
   return (
     <section className="flex h-full items-center justify-center overflow-auto bg-[#F7F8FB] px-4 py-6 lg:px-8">
       <div className="mx-auto grid w-full max-w-[1120px] overflow-hidden rounded-[28px] border border-border bg-white shadow-xl shadow-ink/10 lg:grid-cols-[minmax(0,0.35fr)_minmax(0,0.65fr)]">
@@ -1161,6 +1031,10 @@ function SourceScreen({
               <li className="flex gap-2">
                 <Check size={15} className="mt-0.5 shrink-0" /> Source information up to 100,000
                 characters
+              </li>
+              <li className="flex gap-2">
+                <Info size={15} className="mt-0.5 shrink-0" /> Automatic field detection currently
+                covers page 1
               </li>
             </ul>
           </div>
@@ -1238,6 +1112,21 @@ function SourceScreen({
             />
           </section>
 
+          <section className="rounded-2xl border border-border bg-white p-4 shadow-sm sm:p-5">
+            <h3 className="font-bold">Optional instructions</h3>
+            <p className="mb-3 mt-1 text-sm text-muted-foreground">
+              Add context or preferences for mapping the source information.
+            </p>
+            <Textarea
+              value={instructions}
+              onChange={(event) => onInstructionsChange(event.target.value)}
+              disabled={busy}
+              className="min-h-20 resize-y rounded-xl border-border bg-cream/20 p-3 text-sm leading-6"
+              placeholder="For example: use the legal business name exactly as written."
+              aria-label="Optional workflow instructions"
+            />
+          </section>
+
           {(inputError || requestError) && (
             <InlineAlert>
               {inputError || requestError}
@@ -1250,16 +1139,30 @@ function SourceScreen({
                   <Eye size={13} /> View API response
                 </button>
               )}
-              {hasTrace && (
-                <button
-                  type="button"
-                  className="ml-2 inline-flex items-center gap-1 font-bold underline underline-offset-2"
-                  onClick={onViewTrace}
-                >
-                  <Info size={13} /> View stage trace
-                </button>
-              )}
             </InlineAlert>
+          )}
+
+          {!busy && liveEvents.length > 0 && (
+            <details className="rounded-xl border border-border p-3">
+              <summary className="cursor-pointer font-semibold">Workflow trace</summary>
+              <div className="mt-3 space-y-1">
+                {liveEvents.map((event, index) => (
+                  <div key={`${event.event}-${index}`}>
+                    <div className="flex justify-between gap-3 text-xs">
+                      <span className="truncate">
+                        {String(event.data["label"] ?? event.data["tool"] ?? event.event)}
+                      </span>
+                      <span className="shrink-0 text-muted-foreground">
+                        {String(event.data["status"] ?? "received")}
+                      </span>
+                    </div>
+                    {typeof event.data["error"] === "string" && event.data["error"] && (
+                      <p className="text-xs text-destructive">{event.data["error"]}</p>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </details>
           )}
 
           <div className="pt-2" aria-busy={busy}>
@@ -1268,14 +1171,20 @@ function SourceScreen({
                 <Brain size={19} />
               </span>
               <div>
-                <h3 className="text-base font-bold text-foreground">Field mapping</h3>
+                <h3 className="text-base font-bold text-foreground">
+                  {busy ? "Workflow progress" : "Field mapping"}
+                </h3>
                 <p className="text-xs text-muted-foreground">
-                  {busy ? "Preparing your review" : "Map your PDF and source information"}
+                  {busy ? currentProgress.stage : "Map your PDF and source information"}
                 </p>
               </div>
             </div>
             {busy ? (
-              <AnalysisLoadingCard />
+              <AnalysisLoadingCard
+                progress={currentProgress.progress}
+                stageLabel={currentProgress.stage}
+                label={`Running ${currentProgress.label}…`}
+              />
             ) : (
               <Button type="submit" className="h-12 w-full rounded-xl text-sm font-bold">
                 <Sparkles size={17} /> Run AI parse & map <ChevronRight size={17} />
@@ -1288,10 +1197,448 @@ function SourceScreen({
   );
 }
 
+function WorkflowResultScreen({
+  result,
+  pdfUrl,
+  pdfBase64,
+  file,
+  sourceText,
+  instructions,
+  onEditSource,
+}: {
+  result: WorkflowResponse;
+  pdfUrl: string | null;
+  pdfBase64: string | null;
+  file: File | null;
+  sourceText: string;
+  instructions: string;
+  onEditSource: () => void;
+}) {
+  const fields = useMemo(() => toReviewFields(result), [result]);
+  const { values, dirty, setValue } = useFieldValues(fields, result.workflow_id);
+  const [selectedId, setSelectedId] = useState<string | null>(fields[0]?.field_id ?? null);
+  const [page, setPage] = useState(1);
+  const [pageCount, setPageCount] = useState(() =>
+    Math.max(1, ...fields.map((field) => field.page)),
+  );
+  const [zoom, setZoom] = useState(defaultZoom);
+  const [showHighlights, setShowHighlights] = useState(false);
+  const mappedCount = fields.filter(
+    (field) => (values[field.field_id] ?? field.mapped_value ?? "") !== "",
+  ).length;
+  const prefilledTemplateFields = (result.template_fields ?? []).filter(
+    (field) => field.field_state === "PRE_FILLED",
+  );
+  const requiredTemplateFields = (result.template_fields ?? []).filter(
+    (field) => field.field_state === "REQUIRES_INPUT",
+  );
+  const reviewCount = result.unresolved_fields.length;
+  const completed = result.status === "completed" && reviewCount === 0;
+  const [downloading, setDownloading] = useState<PdfType | null>(null);
+  const [downloadError, setDownloadError] = useState("");
+
+  const triggerDownload = (url: string, filename: string) => {
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  };
+
+  const downloadEditablePdf = async () => {
+    if (!pdfBase64) {
+      setDownloadError("The filled PDF is no longer available. Edit the source and rerun.");
+      return;
+    }
+    setDownloadError("");
+    setDownloading("acroform");
+    try {
+      const blob = await finalizeReviewedPdf({
+        pdfBase64,
+        fields,
+        values,
+        pdfType: "acroform",
+        filename: result.pdf_filename || file?.name || "filled_document.pdf",
+        compositeWidgetNames: result.composite_widget_names,
+      });
+      const url = URL.createObjectURL(blob);
+      triggerDownload(url, result.pdf_filename || "filled_document.pdf");
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (error) {
+      setDownloadError(
+        error instanceof Error ? error.message : "Could not prepare the editable PDF.",
+      );
+    } finally {
+      setDownloading(null);
+    }
+  };
+
+  const downloadNormalPdf = async () => {
+    if (!pdfBase64) {
+      setDownloadError("The filled PDF is no longer available. Edit the source and rerun.");
+      return;
+    }
+    setDownloading("normal");
+    setDownloadError("");
+    try {
+      const blob = await finalizeReviewedPdf({
+        pdfBase64,
+        fields,
+        values,
+        pdfType: "normal",
+        filename: result.pdf_filename || file?.name || "filled_document.pdf",
+        compositeWidgetNames: result.composite_widget_names,
+      });
+      const url = URL.createObjectURL(blob);
+      triggerDownload(url, `normal_${result.pdf_filename || file?.name || "filled_document.pdf"}`);
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (error) {
+      setDownloadError(
+        error instanceof Error ? error.message : "Could not download the normal PDF.",
+      );
+    } finally {
+      setDownloading(null);
+    }
+  };
+
+  useEffect(() => {
+    if (selectedId) {
+      const selected = fields.find((field) => field.field_id === selectedId);
+      if (selected) setPage(selected.page);
+      document
+        .getElementById(`field-card-${selectedId}`)
+        ?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
+  }, [fields, selectedId]);
+
+  return (
+    <section className="flex h-full min-h-0 flex-col overflow-hidden bg-white">
+      <header className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-3 lg:px-8">
+        <div>
+          <h1 className="font-display text-xl font-bold">
+            {completed
+              ? "Form ready"
+              : result.status === "failed"
+                ? "Workflow failed"
+                : "Review results"}
+          </h1>
+          <p className="text-sm text-muted-foreground">{result.pdf_filename || "Uploaded PDF"}</p>
+        </div>
+        <div className="flex gap-2">
+          <Button variant="outline" onClick={onEditSource} disabled={downloading !== null}>
+            <ArrowLeft size={15} /> Edit source and rerun
+          </Button>
+          {/* Split download button: main action downloads the normal (flattened)
+              PDF; the dropdown arrow exposes both format choices. */}
+          <div className="flex items-center">
+            <Button
+              onClick={() => void downloadNormalPdf()}
+              disabled={!pdfBase64 || downloading !== null}
+              className="rounded-r-none"
+            >
+              {downloading === "normal" ? (
+                <Loader2 size={16} className="animate-spin" />
+              ) : (
+                <Download size={16} />
+              )}
+              {downloading === "normal" ? "Preparing PDF…" : "Download PDF"}
+            </Button>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  disabled={!pdfBase64 || downloading !== null}
+                  className="rounded-l-none border-l border-primary-foreground/20 px-2"
+                >
+                  <ChevronDown size={15} />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-72">
+                <DropdownMenuLabel>Choose PDF format</DropdownMenuLabel>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  onSelect={() => void downloadNormalPdf()}
+                  disabled={!pdfBase64 || downloading !== null}
+                  className="items-start gap-2 py-2"
+                >
+                  <FileCheck2 size={16} className="mt-0.5" />
+                  <div className="flex flex-col gap-0.5">
+                    <span className="font-semibold">Normal PDF</span>
+                    <span className="text-xs text-muted-foreground">
+                      {downloading === "normal"
+                        ? "Preparing normal PDF…"
+                        : "Values burned in, locked for sharing"}
+                    </span>
+                  </div>
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onSelect={() => void downloadEditablePdf()}
+                  disabled={!pdfBase64 || downloading !== null}
+                  className="items-start gap-2 py-2"
+                >
+                  <FileText size={16} className="mt-0.5" />
+                  <div className="flex flex-col gap-0.5">
+                    <span className="font-semibold">Editable PDF</span>
+                    <span className="text-xs text-muted-foreground">
+                      {downloading === "acroform"
+                        ? "Preparing editable PDF…"
+                        : "Form fields stay fillable (AcroForm)"}
+                    </span>
+                  </div>
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+        </div>
+      </header>
+
+      {downloadError && (
+        <div className="border-b border-destructive/20 bg-destructive/5 px-5 py-2 text-sm text-destructive">
+          {downloadError}
+        </div>
+      )}
+
+      {!completed && result.status !== "failed" && (
+        <div className="flex items-start gap-2 border-b border-amber-300 bg-amber-50 px-5 py-3 text-sm text-amber-950">
+          <AlertTriangle size={17} className="mt-0.5 shrink-0" />
+          <span>
+            {reviewCount > 0
+              ? `${reviewCount} field${reviewCount === 1 ? " needs" : "s need"} review. Check the values before using the PDF.`
+              : "The workflow completed with items that need review."}
+          </span>
+        </div>
+      )}
+      {result.status === "failed" && result.error && (
+        <div className="border-b border-destructive/20 bg-destructive/5 px-5 py-3 text-sm text-destructive">
+          {result.error}
+        </div>
+      )}
+
+      <div className="grid min-h-0 flex-1 lg:grid-cols-[minmax(0,1.1fr)_minmax(340px,0.9fr)]">
+        <div className="min-h-[360px] border-b border-border lg:border-b-0 lg:border-r">
+          {pdfUrl ? (
+            <div className="flex h-full min-h-[360px] flex-col">
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b px-4 py-2 text-sm">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-semibold text-muted-foreground">PDF</span>
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    aria-label="Previous page"
+                    disabled={page <= 1}
+                    onClick={() => setPage((p) => Math.max(1, p - 1))}
+                  >
+                    <ChevronLeft size={16} />
+                  </Button>
+                  <span className="min-w-20 text-center">
+                    Page {page} of {pageCount}
+                  </span>
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    aria-label="Next page"
+                    disabled={page >= pageCount}
+                    onClick={() => setPage((p) => Math.min(pageCount, p + 1))}
+                  >
+                    <ChevronRight size={16} />
+                  </Button>
+                </div>
+                <div className="flex items-center gap-1 rounded-full border border-border px-2 py-1">
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    aria-label="Zoom out"
+                    disabled={zoom <= zoomLevels[0]}
+                    onClick={() => setZoom((value) => zoomStep(value, -1))}
+                  >
+                    <ZoomOut size={15} />
+                  </Button>
+                  <span className="min-w-12 text-center text-xs font-semibold">{zoom}%</span>
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    aria-label="Zoom in"
+                    disabled={zoom >= (zoomLevels.at(-1) ?? defaultZoom)}
+                    onClick={() => setZoom((value) => zoomStep(value, 1))}
+                  >
+                    <ZoomIn size={15} />
+                  </Button>
+                </div>
+                <Button
+                  size="sm"
+                  variant={showHighlights ? "outline" : "ghost"}
+                  aria-pressed={showHighlights}
+                  onClick={() => setShowHighlights((value) => !value)}
+                >
+                  <Eye size={15} />
+                  {showHighlights ? "Hide highlights" : "Show highlights"}
+                </Button>
+              </div>
+              {dirty.size > 0 && (
+                <div
+                  className="border-b px-4 py-1 text-xs font-medium text-primary"
+                  aria-live="polite"
+                >
+                  Live preview · {dirty.size} field{dirty.size === 1 ? "" : "s"} edited
+                </div>
+              )}
+              <FilledPdfPreview
+                pdfUrl={pdfUrl}
+                fields={fields}
+                values={values}
+                onValueChange={setValue}
+                selectedFieldId={selectedId}
+                onSelectField={setSelectedId}
+                page={page}
+                scale={zoom / 100}
+                showHighlights={showHighlights}
+                onPageCountChange={setPageCount}
+              />
+            </div>
+          ) : (
+            <div className="flex h-full min-h-[360px] items-center justify-center p-8 text-center text-sm text-muted-foreground">
+              No PDF was produced. Review the tool trace, edit the source information, and rerun.
+            </div>
+          )}
+        </div>
+
+        <div className="min-h-0 overflow-y-auto p-4 lg:p-6">
+          <div className="mb-4 flex items-center justify-between">
+            <h2 className="font-display text-lg font-bold">Mapped fields</h2>
+            <span className="text-xs text-muted-foreground">
+              {mappedCount} / {fields.length} mapped
+            </span>
+          </div>
+          {(prefilledTemplateFields.length > 0 || requiredTemplateFields.length > 0) && (
+            <div className="mb-4 space-y-3 rounded-xl border bg-muted/30 p-3 text-sm">
+              {prefilledTemplateFields.length > 0 && (
+                <section>
+                  <h3 className="font-semibold text-success">Existing template values preserved</h3>
+                  <ul className="mt-1 space-y-1 text-xs text-muted-foreground">
+                    {prefilledTemplateFields.map((field) => (
+                      <li key={field.field_id}>
+                        <span className="font-medium text-foreground">{field.label}</span>
+                        {field.existing_value ? ` · ${field.existing_value}` : ""}
+                      </li>
+                    ))}
+                  </ul>
+                </section>
+              )}
+              {requiredTemplateFields.length > 0 && (
+                <section>
+                  <h3 className="font-semibold text-amber-700">Needs input or review</h3>
+                  <ul className="mt-1 space-y-1 text-xs text-muted-foreground">
+                    {requiredTemplateFields.map((field) => (
+                      <li key={field.field_id}>{field.label}</li>
+                    ))}
+                  </ul>
+                </section>
+              )}
+            </div>
+          )}
+          <div className="space-y-2">
+            {fields.map((field) => {
+              const currentValue = values[field.field_id] ?? field.mapped_value ?? "";
+              return (
+                <div
+                  key={field.field_id}
+                  id={`field-card-${field.field_id}`}
+                  onClick={() => {
+                    setSelectedId(field.field_id);
+                    setPage(field.page);
+                  }}
+                  className={`w-full rounded-xl border p-3 text-left ${selectedId === field.field_id ? "border-primary bg-primary/5" : "border-border"}`}
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <span className="font-semibold">{field.label}</span>
+                    <span
+                      className={`shrink-0 text-xs font-semibold ${field.status === "filled" ? "text-success" : "text-amber-700"}`}
+                    >
+                      {currentValue
+                        ? field.status === "filled"
+                          ? "Filled · editable"
+                          : "Needs review · editable"
+                        : field.status === "filled"
+                          ? "Filled · editable"
+                          : field.mapped_value
+                            ? "Needs review"
+                            : "Unmapped"}
+                    </span>
+                  </div>
+                  <label
+                    className="mt-2 block text-xs font-medium text-muted-foreground"
+                    htmlFor={`edit-${field.field_id}`}
+                  >
+                    Value
+                  </label>
+                  <input
+                    id={`edit-${field.field_id}`}
+                    value={currentValue}
+                    disabled={field.field_type.toLowerCase().includes("signature")}
+                    onFocus={() => {
+                      setSelectedId(field.field_id);
+                      setPage(field.page);
+                    }}
+                    onChange={(event) => setValue(field.field_id, event.target.value)}
+                    className="mt-1 w-full rounded-md border border-border bg-white px-3 py-2 text-sm text-foreground outline-none focus:border-primary focus:ring-2 focus:ring-primary/20 disabled:bg-muted"
+                    placeholder="Enter a value"
+                  />
+                  {field.source_quote && (
+                    <p className="mt-2 text-xs text-muted-foreground">
+                      Evidence: {field.source_quote}
+                    </p>
+                  )}
+                  {field.reason && (
+                    <p className="mt-2 text-xs text-amber-800">Review: {field.reason}</p>
+                  )}
+                </div>
+              );
+            })}
+            {fields.length === 0 && (
+              <p className="text-sm text-muted-foreground">No field results were returned.</p>
+            )}
+          </div>
+          <details
+            className="mt-5 rounded-xl border border-border p-3"
+            open={result.status === "failed"}
+          >
+            <summary className="cursor-pointer font-semibold">Agent and tool trace</summary>
+            <div className="mt-3 space-y-2">
+              {result.tool_calls.map((call, index) => (
+                <div
+                  key={`${String(call["tool"])}-${index}`}
+                  className="rounded-lg bg-muted/50 p-3 text-sm"
+                >
+                  <div className="flex justify-between gap-2 font-semibold">
+                    <span>{String(call["label"] ?? call["tool"] ?? "Workflow step")}</span>
+                    <span>{String(call["status"] ?? "unknown")}</span>
+                  </div>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {String(call["error"] || call["output_summary"] || "")}
+                  </p>
+                </div>
+              ))}
+              {result.tool_calls.length === 0 && (
+                <p className="text-sm text-muted-foreground">No tool events were recorded.</p>
+              )}
+            </div>
+          </details>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 type ReviewFilter = "all" | ReviewStatus;
 
 const zoomLevels = [75, 100, 125, 150, 175, 200] as const;
 const defaultZoom = 150;
+
+function zoomStep(current: number, direction: -1 | 1) {
+  const nextIndex = zoomLevels.findIndex((level) => level >= current);
+  const index = nextIndex === -1 ? zoomLevels.length - 1 : nextIndex;
+  return zoomLevels[Math.min(zoomLevels.length - 1, Math.max(0, index + direction))] ?? defaultZoom;
+}
 
 function ResultScreen({
   result,
@@ -1775,7 +2122,11 @@ function ResultScreen({
         <div className="mx-auto max-w-[920px]">
           {finalizing && (
             <div className="mb-2">
-              <AnalysisLoadingCard label="Generating and verifying the final PDF…" />
+              <AnalysisLoadingCard
+                label="Generating and verifying the final PDF…"
+                stageLabel="Stage 4 of 4 · Fill and verify PDF"
+                progress={90}
+              />
             </div>
           )}
           {error && (
