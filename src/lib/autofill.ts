@@ -27,6 +27,8 @@ export type AutofillField = {
   verification_status: "passed" | "failed" | "not_checked";
   reason: string | null;
   value_origin?: "source" | "normalized" | "derived";
+  /** User-selected font size for this field. Null means auto-fit. */
+  font_size?: number | null;
 };
 
 export type StageTrace = {
@@ -143,6 +145,12 @@ function isAutofillField(value: unknown): value is AutofillField {
       (Array.isArray(field.entry_regions) && field.entry_regions.every(isPdfRect))) &&
     (field.write_rects === undefined ||
       (Array.isArray(field.write_rects) && field.write_rects.every(isPdfRect))) &&
+    (field.font_size === undefined ||
+      field.font_size === null ||
+      (typeof field.font_size === "number" &&
+        Number.isFinite(field.font_size) &&
+        field.font_size >= 6 &&
+        field.font_size <= 72)) &&
     isStringOrNull(field.mapped_value) &&
     isStringOrNull(field.written_value) &&
     isStringOrNull(field.source_quote) &&

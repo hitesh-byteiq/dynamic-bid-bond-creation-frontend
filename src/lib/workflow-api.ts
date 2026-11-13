@@ -32,6 +32,30 @@ export type WorkflowResponse = {
   tool_calls: Array<Record<string, unknown>>;
   repair_history: Array<Record<string, unknown>>;
   quality: Record<string, unknown>;
+  template: {
+    sha256: string;
+    schema_id: string;
+    schema_status: string;
+    schema_source: string;
+  };
+};
+
+/** Client-side per-field settings that travel with the finalize request. */
+export type FieldSettings = {
+  font_size?: number | null;
+};
+
+export type ReviewSubmissionPayload = {
+  workflow_id: string;
+  filename: string;
+  pdf_sha256: string;
+  fields: Array<{
+    field_id: string;
+    label: string;
+    field_type: string;
+    value: string;
+    font_size: number | null;
+  }>;
 };
 
 function apiBaseUrl() {
@@ -45,64 +69,6 @@ function base64ToPdfBlob(base64: string): Blob {
     bytes[index] = binary.charCodeAt(index);
   }
   return new Blob([bytes], { type: "application/pdf" });
-}
-
-/** Apply the current review values and return the requested PDF format. */
-export async function finalizeReviewedPdf({
-  pdfBase64,
-  fields,
-  values,
-  pdfType,
-  filename,
-  compositeWidgetNames = {},
-}: {
-  pdfBase64: string;
-  fields: AutofillField[];
-  values: Record<string, string>;
-  pdfType: PdfType;
-  filename: string;
-  compositeWidgetNames?: Record<string, string[]>;
-}): Promise<Blob> {
-  const fieldPayload = fields.map((field) => {
-    const names = compositeWidgetNames[field.field_id] ?? [];
-    const componentWidgetNames: Record<string, string> = {};
-    field.date_targets?.forEach((target, index) => {
-      const component = target.component;
-      const name = names[index];
-      if (component && name) componentWidgetNames[component] = name;
-    });
-    return {
-      field_id: field.field_id,
-      label: field.label,
-      field_type: field.field_type,
-      blank_style: field.blank_style ?? "",
-      widget_name: field.widget_name || field.field_name || field.field_id,
-      component_widget_names: componentWidgetNames,
-      value: values[field.field_id] ?? field.mapped_value ?? "",
-    };
-  });
-  const formData = new FormData();
-  formData.append("file", base64ToPdfBlob(pdfBase64), filename || "filled_document.pdf");
-  formData.append("fields", JSON.stringify(fieldPayload));
-  formData.append("pdf_type", pdfType);
-
-  const response = await fetch(`${apiBaseUrl()}/api/pdf/finalize`, {
-    method: "POST",
-    body: formData,
-    headers: { Accept: "application/pdf" },
-  });
-  if (!response.ok) {
-    const body = await response.text();
-    let detail = body;
-    try {
-      const parsed: unknown = JSON.parse(body);
-      if (isRecord(parsed) && typeof parsed["detail"] === "string") detail = parsed["detail"];
-    } catch {
-      // Keep the response body as a readable HTTP error.
-    }
-    throw new Error(detail || `PDF finalization failed (HTTP ${response.status}).`);
-  }
-  return response.blob();
 }
 
 export async function runWorkflow(
@@ -180,7 +146,91 @@ export async function runWorkflow(
   return finalResult;
 }
 
-/** Compatibility helper for callers that already have a filled AcroForm PDF. */
+/** Persist the final reviewed values and settings to the backend. */
+export async function submitReview(payload: ReviewSubmissionPayload): Promise<void> {
+  const response = await fetch(`${apiBaseUrl()}/api/workflow/submit`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const body = await response.text();
+    let detail = body;
+    try {
+      const parsed: unknown = JSON.parse(body);
+      if (isRecord(parsed) && typeof parsed["detail"] === "string") detail = parsed["detail"];
+    } catch {
+      // Keep the response body as a readable HTTP error.
+    }
+    throw new Error(detail || `Review submission failed (HTTP ${response.status}).`);
+  }
+}
+
+/** Apply the current review values and return the requested PDF format.
+ *
+ * This path sends the filled workflow PDF back to the backend, which updates
+ * the AcroForm widgets with the latest review values and returns the PDF.
+ */
+export async function finalizeReviewedPdf({
+  pdfBase64,
+  fields,
+  values,
+  settings = {},
+  pdfType,
+  filename,
+  compositeWidgetNames = {},
+}: {
+  pdfBase64: string;
+  fields: AutofillField[];
+  values: Record<string, string>;
+  settings?: Record<string, FieldSettings>;
+  pdfType: PdfType;
+  filename: string;
+  compositeWidgetNames?: Record<string, string[]> | undefined;
+}): Promise<Blob> {
+  const fieldPayload = fields.map((field) => {
+    const names = compositeWidgetNames[field.field_id] ?? [];
+    const componentWidgetNames: Record<string, string> = {};
+    field.date_targets?.forEach((target, index) => {
+      const component = target.component;
+      const name = names[index];
+      if (component && name) componentWidgetNames[component] = name;
+    });
+    return {
+      field_id: field.field_id,
+      label: field.label,
+      field_type: field.field_type,
+      blank_style: field.blank_style ?? "",
+      widget_name: field.widget_name || field.field_name || field.field_id,
+      component_widget_names: componentWidgetNames,
+      value: values[field.field_id] ?? field.mapped_value ?? "",
+      font_size: settings[field.field_id]?.font_size ?? null,
+    };
+  });
+  const formData = new FormData();
+  formData.append("file", base64ToPdfBlob(pdfBase64), filename || "filled_document.pdf");
+  formData.append("fields", JSON.stringify(fieldPayload));
+  formData.append("pdf_type", pdfType);
+
+  const response = await fetch(`${apiBaseUrl()}/api/pdf/finalize`, {
+    method: "POST",
+    body: formData,
+    headers: { Accept: "application/pdf" },
+  });
+  if (!response.ok) {
+    const body = await response.text();
+    let detail = body;
+    try {
+      const parsed: unknown = JSON.parse(body);
+      if (isRecord(parsed) && typeof parsed["detail"] === "string") detail = parsed["detail"];
+    } catch {
+      // Keep the response body as a readable HTTP error.
+    }
+    throw new Error(detail || `PDF finalization failed (HTTP ${response.status}).`);
+  }
+  return response.blob();
+}
+
 export async function flattenPdf(filledPdf: Blob, filename?: string): Promise<Blob> {
   const formData = new FormData();
   formData.append("file", filledPdf, filename || "filled_document.pdf");
@@ -209,18 +259,15 @@ export async function flattenPdf(filledPdf: Blob, filename?: string): Promise<Bl
 export async function downloadFilledPdf({
   file,
   sourceText,
-  instructions,
   pdfType,
 }: {
   file: File;
   sourceText: string;
-  instructions?: string;
   pdfType: PdfType;
 }): Promise<Blob> {
   const formData = new FormData();
   formData.append("file", file, file.name);
   formData.append("source_text", sourceText);
-  if (instructions?.trim()) formData.append("instructions", instructions.trim());
   formData.append("pdf_type", pdfType);
 
   const response = await fetch(`${apiBaseUrl()}/api/workflow/run/download`, {
