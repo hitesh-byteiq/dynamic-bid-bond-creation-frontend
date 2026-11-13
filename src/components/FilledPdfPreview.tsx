@@ -22,6 +22,7 @@ type Props = {
   fields: AutofillField[];
   /** Live review values keyed by `field_id`. */
   values?: Record<string, string>;
+  fontSizes?: Record<string, number | null> | undefined;
   onValueChange?: ((fieldId: string, value: string) => void) | undefined;
   selectedFieldId: string | null;
   onSelectField: (fieldId: string) => void;
@@ -105,6 +106,26 @@ function setElementValue(element: FormElement, value: string) {
   if (element.value !== value) element.value = value;
 }
 
+/**
+ * Font sizes are chosen in PDF points. pdf.js maps one point to `scale` CSS
+ * pixels in the viewport, so scale before applying the value to the DOM.
+ */
+function applyWidgetFontSize(
+  element: FormElement,
+  fieldId: string,
+  fontSizes: Record<string, number | null> | undefined,
+  scale: number,
+) {
+  const size = fontSizes?.[fieldId];
+  if (typeof size === "number" && size > 0) {
+    element.style.fontSize = `${(size * scale).toFixed(2)}px`;
+    element.style.lineHeight = "1.1";
+  } else {
+    element.style.fontSize = "";
+    element.style.lineHeight = "";
+  }
+}
+
 function valueForBinding(binding: WidgetBinding, values: Record<string, string>) {
   const raw = values[binding.field.field_id] ?? binding.field.mapped_value ?? "";
   if (!binding.component) return raw;
@@ -134,6 +155,8 @@ function bindFormWidgets({
   annotations,
   fields,
   values,
+  fontSizes,
+  scale,
   onValueChange,
   onSelectField,
 }: {
@@ -141,6 +164,8 @@ function bindFormWidgets({
   annotations: Array<Record<string, unknown>>;
   fields: AutofillField[];
   values: Record<string, string>;
+  fontSizes: Record<string, number | null> | undefined;
+  scale: number;
   onValueChange?: ((fieldId: string, value: string) => void) | undefined;
   onSelectField: (fieldId: string) => void;
 }) {
@@ -159,6 +184,7 @@ function bindFormWidgets({
 
     element.dataset["fieldId"] = binding.field.field_id;
     setElementValue(element, valueForBinding(binding, values));
+    applyWidgetFontSize(element, binding.field.field_id, fontSizes, scale);
     bound.set(element, binding);
 
     const handleChange = () => {
@@ -179,6 +205,7 @@ function PdfPage({
   pageCount,
   fields,
   values,
+  fontSizes,
   onValueChange,
   selectedFieldId,
   onSelectField,
@@ -190,6 +217,7 @@ function PdfPage({
   pageCount: number;
   fields: AutofillField[];
   values: Record<string, string>;
+  fontSizes?: Record<string, number | null> | undefined;
   onValueChange?: ((fieldId: string, value: string) => void) | undefined;
   selectedFieldId: string | null;
   onSelectField: (fieldId: string) => void;
@@ -201,6 +229,8 @@ function PdfPage({
   const widgetBindingsRef = useRef<Map<FormElement, WidgetBinding>>(new Map());
   const valuesRef = useRef(values);
   valuesRef.current = values;
+  const fontSizesRef = useRef(fontSizes);
+  fontSizesRef.current = fontSizes;
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [widgetFieldIds, setWidgetFieldIds] = useState<Set<string>>(() => new Set());
@@ -316,6 +346,8 @@ function PdfPage({
               annotations,
               fields,
               values: valuesRef.current,
+              fontSizes: fontSizesRef.current,
+              scale,
               onValueChange,
               onSelectField,
             });
@@ -353,6 +385,15 @@ function PdfPage({
       setElementValue(element, valueForBinding(binding, values));
     }
   }, [values]);
+
+  // Apply user-selected font sizes to rendered AcroForm widget inputs.
+  // `ready`/`scale` are included because a zoom or re-render recreates the
+  // widgets, which drops any inline styles applied previously.
+  useEffect(() => {
+    for (const [element, binding] of widgetBindingsRef.current) {
+      applyWidgetFontSize(element, binding.field.field_id, fontSizes, scale);
+    }
+  }, [fontSizes, scale, ready]);
 
   const pageWidth = layout?.width ?? 612;
   const pageHeight = layout?.height ?? 792;
@@ -394,7 +435,13 @@ function PdfPage({
               const checkbox = field.field_type.toLowerCase().includes("checkbox");
               const title = value ? `${field.label}: ${value}` : field.label;
               const pxHeight = (layout.height * rect.height) / 100;
-              const fontSize = Math.max(7, Math.min(20, pxHeight * 0.62 || 11));
+              const userFontSize = fontSizes?.[field.field_id];
+              // The fallback is already in CSS pixels; the user value is in
+              // PDF points, which pdf.js maps to pixels via `scale`.
+              const fontSize =
+                typeof userFontSize === "number" && userFontSize > 0
+                  ? userFontSize * scale
+                  : Math.max(7, Math.min(20, pxHeight * 0.62 || 11));
 
               return (
                 <div key={`${field.field_id}-${index}`} className="contents">
@@ -484,6 +531,7 @@ export function FilledPdfPreview({
   pdfUrl,
   fields,
   values = {},
+  fontSizes,
   onValueChange,
   selectedFieldId,
   onSelectField,
@@ -574,6 +622,7 @@ export function FilledPdfPreview({
           pageCount={pageCount}
           fields={fields}
           values={values}
+          fontSizes={fontSizes}
           onValueChange={onValueChange}
           selectedFieldId={selectedFieldId}
           onSelectField={onSelectField}

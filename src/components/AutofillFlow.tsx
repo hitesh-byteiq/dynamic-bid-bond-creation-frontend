@@ -48,6 +48,7 @@ import { FilledPdfPreview } from "@/components/FilledPdfPreview";
 import {
   finalizeReviewedPdf,
   runWorkflow,
+  submitReview,
   toReviewFields,
   type PdfType,
   type WorkflowEvent,
@@ -101,7 +102,6 @@ export function AutofillFlow() {
   const [stage, setStage] = useState<"landing" | "source" | "result">("landing");
   const [file, setFile] = useState<File | null>(null);
   const [rawText, setRawText] = useState("");
-  const [instructions, setInstructions] = useState("");
   const [liveEvents, setLiveEvents] = useState<WorkflowEvent[]>([]);
   const [inputError, setInputError] = useState("");
   const [requestError, setRequestError] = useState("");
@@ -173,7 +173,6 @@ export function AutofillFlow() {
     const formData = new FormData();
     formData.append("file", file, file.name);
     formData.append("source_text", rawText);
-    if (instructions.trim()) formData.append("instructions", instructions.trim());
 
     try {
       const payload = await runWorkflow(formData, (event) => {
@@ -221,7 +220,6 @@ export function AutofillFlow() {
     setInputError("");
     setFile(null);
     setRawText("");
-    setInstructions("");
     if (fileInputRef.current) fileInputRef.current.value = "";
     setStage("source");
   };
@@ -245,8 +243,6 @@ export function AutofillFlow() {
                 inputError={inputError}
                 onFileChange={(event) => chooseFile(event.target.files?.[0] ?? null)}
                 onRawTextChange={setRawText}
-                instructions={instructions}
-                onInstructionsChange={setInstructions}
                 liveEvents={liveEvents}
                 onSubmit={handleSourceSubmit}
                 rawText={rawText}
@@ -261,7 +257,6 @@ export function AutofillFlow() {
                 pdfBase64={result.pdf_base64}
                 file={file}
                 sourceText={rawText}
-                instructions={instructions}
                 onEditSource={() => setStage("source")}
               />
             ) : null}
@@ -975,8 +970,6 @@ function SourceScreen({
   inputError,
   onFileChange,
   onRawTextChange,
-  instructions,
-  onInstructionsChange,
   liveEvents,
   onSubmit,
   rawText,
@@ -990,8 +983,6 @@ function SourceScreen({
   inputError: string;
   onFileChange: (event: React.ChangeEvent<HTMLInputElement>) => void;
   onRawTextChange: (value: string) => void;
-  instructions: string;
-  onInstructionsChange: (value: string) => void;
   liveEvents: WorkflowEvent[];
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
   rawText: string;
@@ -1025,16 +1016,15 @@ function SourceScreen({
                 <Check size={15} className="mt-0.5 shrink-0" /> PDF up to 20 MiB, 1–3 pages
               </li>
               <li className="flex gap-2">
-                <Check size={15} className="mt-0.5 shrink-0" /> Selectable text or a scan supported
-                by OCR
+                <Check size={15} className="mt-0.5 shrink-0" /> Text-based PDF or a clean scan
               </li>
               <li className="flex gap-2">
                 <Check size={15} className="mt-0.5 shrink-0" /> Source information up to 100,000
                 characters
               </li>
               <li className="flex gap-2">
-                <Info size={15} className="mt-0.5 shrink-0" /> Automatic field detection currently
-                covers page 1
+                <Info size={15} className="mt-0.5 shrink-0" /> Automatic field detection covers
+                every page
               </li>
             </ul>
           </div>
@@ -1109,21 +1099,6 @@ function SourceScreen({
               className="min-h-40 resize-y rounded-xl border-border bg-cream/20 p-3 text-sm leading-6"
               placeholder="Paste the project, bidder, obligee, bid amount, dates, and other relevant details…"
               aria-label="Business information"
-            />
-          </section>
-
-          <section className="rounded-2xl border border-border bg-white p-4 shadow-sm sm:p-5">
-            <h3 className="font-bold">Optional instructions</h3>
-            <p className="mb-3 mt-1 text-sm text-muted-foreground">
-              Add context or preferences for mapping the source information.
-            </p>
-            <Textarea
-              value={instructions}
-              onChange={(event) => onInstructionsChange(event.target.value)}
-              disabled={busy}
-              className="min-h-20 resize-y rounded-xl border-border bg-cream/20 p-3 text-sm leading-6"
-              placeholder="For example: use the legal business name exactly as written."
-              aria-label="Optional workflow instructions"
             />
           </section>
 
@@ -1203,7 +1178,6 @@ function WorkflowResultScreen({
   pdfBase64,
   file,
   sourceText,
-  instructions,
   onEditSource,
 }: {
   result: WorkflowResponse;
@@ -1211,13 +1185,20 @@ function WorkflowResultScreen({
   pdfBase64: string | null;
   file: File | null;
   sourceText: string;
-  instructions: string;
   onEditSource: () => void;
 }) {
   const fields = useMemo(() => toReviewFields(result), [result]);
-  const { values, dirty, setValue } = useFieldValues(fields, result.workflow_id);
+  const { values, fontSizes, dirty, setValue, setFontSize } = useFieldValues(
+    fields,
+    result.workflow_id,
+  );
   const [selectedId, setSelectedId] = useState<string | null>(fields[0]?.field_id ?? null);
   const [page, setPage] = useState(1);
+  const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState("");
+  const [submitSuccess, setSubmitSuccess] = useState(false);
+  const [submittedSnapshot, setSubmittedSnapshot] = useState<string | null>(null);
+  const [infoFieldId, setInfoFieldId] = useState<string | null>(null);
   const [pageCount, setPageCount] = useState(() =>
     Math.max(1, ...fields.map((field) => field.page)),
   );
@@ -1234,6 +1215,8 @@ function WorkflowResultScreen({
   );
   const reviewCount = result.unresolved_fields.length;
   const completed = result.status === "completed" && reviewCount === 0;
+  const canSubmitReview = fields.length > 0 && Boolean(result.template.sha256);
+  const reviewSnapshot = useMemo(() => JSON.stringify({ values, fontSizes }), [values, fontSizes]);
   const [downloading, setDownloading] = useState<PdfType | null>(null);
   const [downloadError, setDownloadError] = useState("");
   const [downloadWarning, setDownloadWarning] = useState("");
@@ -1260,6 +1243,9 @@ function WorkflowResultScreen({
         pdfBase64,
         fields,
         values,
+        settings: Object.fromEntries(
+          fields.map((field) => [field.field_id, { font_size: fontSizes[field.field_id] ?? null }]),
+        ),
         pdfType: "acroform",
         filename: result.pdf_filename || file?.name || "filled_document.pdf",
         compositeWidgetNames: result.composite_widget_names,
@@ -1295,6 +1281,9 @@ function WorkflowResultScreen({
         pdfBase64,
         fields,
         values,
+        settings: Object.fromEntries(
+          fields.map((field) => [field.field_id, { font_size: fontSizes[field.field_id] ?? null }]),
+        ),
         pdfType: "normal",
         filename: result.pdf_filename || file?.name || "filled_document.pdf",
         compositeWidgetNames: result.composite_widget_names,
@@ -1317,6 +1306,32 @@ function WorkflowResultScreen({
     }
   };
 
+  const handleSubmitReview = async () => {
+    setSubmitting(true);
+    setSubmitError("");
+    setSubmitSuccess(false);
+    try {
+      await submitReview({
+        workflow_id: result.workflow_id,
+        filename: result.pdf_filename || file?.name || "filled_document.pdf",
+        pdf_sha256: result.template.sha256,
+        fields: fields.map((field) => ({
+          field_id: field.field_id,
+          label: field.label,
+          field_type: field.field_type,
+          value: values[field.field_id] ?? field.mapped_value ?? "",
+          font_size: fontSizes[field.field_id] ?? null,
+        })),
+      });
+      setSubmittedSnapshot(reviewSnapshot);
+      setSubmitSuccess(true);
+    } catch (error) {
+      setSubmitError(error instanceof Error ? error.message : "Submission failed.");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
   useEffect(() => {
     if (selectedId) {
       const selected = fields.find((field) => field.field_id === selectedId);
@@ -1326,6 +1341,13 @@ function WorkflowResultScreen({
         ?.scrollIntoView({ block: "nearest", behavior: "smooth" });
     }
   }, [fields, selectedId]);
+
+  // A saved snapshot no longer matches the form once the user edits it again.
+  useEffect(() => {
+    if (submittedSnapshot !== null && submittedSnapshot !== reviewSnapshot) {
+      setSubmitSuccess(false);
+    }
+  }, [reviewSnapshot, submittedSnapshot]);
 
   return (
     <section className="flex h-full min-h-0 flex-col overflow-hidden bg-white">
@@ -1341,15 +1363,33 @@ function WorkflowResultScreen({
           <p className="text-sm text-muted-foreground">{result.pdf_filename || "Uploaded PDF"}</p>
         </div>
         <div className="flex gap-2">
-          <Button variant="outline" onClick={onEditSource} disabled={downloading !== null}>
+          <Button
+            variant="outline"
+            onClick={onEditSource}
+            disabled={downloading !== null || submitting}
+          >
             <ArrowLeft size={15} /> Edit source and rerun
+          </Button>
+          <Button
+            onClick={() => void handleSubmitReview()}
+            disabled={!canSubmitReview || submitting || downloading !== null}
+            variant={submitSuccess ? "outline" : "default"}
+          >
+            {submitting ? (
+              <Loader2 size={16} className="animate-spin" />
+            ) : submitSuccess ? (
+              <Check size={16} />
+            ) : (
+              <Save size={16} />
+            )}
+            {submitting ? "Saving…" : submitSuccess ? "Saved" : "Submit review"}
           </Button>
           {/* Split download button: main action downloads the normal (flattened)
               PDF; the dropdown arrow exposes both format choices. */}
           <div className="flex items-center">
             <Button
               onClick={() => void downloadNormalPdf()}
-              disabled={!pdfBase64 || downloading !== null}
+              disabled={!pdfBase64 || downloading !== null || submitting}
               className="rounded-r-none"
             >
               {downloading === "normal" ? (
@@ -1362,7 +1402,7 @@ function WorkflowResultScreen({
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <Button
-                  disabled={!pdfBase64 || downloading !== null}
+                  disabled={!pdfBase64 || downloading !== null || submitting}
                   className="rounded-l-none border-l border-primary-foreground/20 px-2"
                 >
                   <ChevronDown size={15} />
@@ -1411,6 +1451,23 @@ function WorkflowResultScreen({
         <div className="border-b border-destructive/20 bg-destructive/5 px-5 py-2 text-sm text-destructive">
           {downloadError}
         </div>
+      )}
+      {submitError && (
+        <div className="border-b border-destructive/20 bg-destructive/5 px-5 py-2 text-sm text-destructive">
+          {submitError}
+        </div>
+      )}
+      {submitSuccess && (
+        <div className="border-b border-success/20 bg-success/5 px-5 py-2 text-sm text-success">
+          Review submitted successfully.
+        </div>
+      )}
+
+      {infoFieldId && (
+        <FieldInfoPopover
+          field={fields.find((f) => f.field_id === infoFieldId) ?? null}
+          onClose={() => setInfoFieldId(null)}
+        />
       )}
 
       {downloadWarning && (
@@ -1508,6 +1565,7 @@ function WorkflowResultScreen({
                 pdfUrl={pdfUrl}
                 fields={fields}
                 values={values}
+                fontSizes={fontSizes}
                 onValueChange={setValue}
                 selectedFieldId={selectedId}
                 onSelectField={setSelectedId}
@@ -1561,6 +1619,8 @@ function WorkflowResultScreen({
           <div className="space-y-2">
             {fields.map((field) => {
               const currentValue = values[field.field_id] ?? field.mapped_value ?? "";
+              const isSignature = field.field_type.toLowerCase().includes("signature");
+              const currentFontSize = fontSizes[field.field_id];
               return (
                 <div
                   key={field.field_id}
@@ -1571,21 +1631,66 @@ function WorkflowResultScreen({
                   }}
                   className={`w-full rounded-xl border p-3 text-left ${selectedId === field.field_id ? "border-primary bg-primary/5" : "border-border"}`}
                 >
-                  <div className="flex items-start justify-between gap-3">
+                  <div className="flex items-center justify-between gap-2">
                     <span className="font-semibold">{field.label}</span>
-                    <span
-                      className={`shrink-0 text-xs font-semibold ${field.status === "filled" ? "text-success" : "text-amber-700"}`}
-                    >
-                      {currentValue
-                        ? field.status === "filled"
-                          ? "Filled · editable"
-                          : "Needs review · editable"
-                        : field.status === "filled"
-                          ? "Filled · editable"
-                          : field.mapped_value
-                            ? "Needs review"
-                            : "Unmapped"}
-                    </span>
+                    <div className="flex items-center gap-1">
+                      <button
+                        type="button"
+                        title="Field details"
+                        className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition hover:bg-muted hover:text-foreground"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setInfoFieldId(field.field_id);
+                        }}
+                      >
+                        <Info size={15} />
+                      </button>
+                      {!isSignature && (
+                        <>
+                          <button
+                            type="button"
+                            title="Decrease font size"
+                            className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition hover:bg-muted hover:text-foreground disabled:opacity-40"
+                            disabled={currentFontSize != null && currentFontSize <= 6}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              const next = (currentFontSize ?? 11) - 0.5;
+                              setFontSize(field.field_id, Math.max(6, next));
+                            }}
+                          >
+                            <Minus size={14} />
+                          </button>
+                          <span className="min-w-[44px] text-center text-xs font-semibold tabular-nums">
+                            {currentFontSize == null ? "Auto" : `${currentFontSize}pt`}
+                          </span>
+                          <button
+                            type="button"
+                            title="Increase font size"
+                            className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition hover:bg-muted hover:text-foreground disabled:opacity-40"
+                            disabled={currentFontSize != null && currentFontSize >= 20}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              const next = (currentFontSize ?? 11) + 0.5;
+                              setFontSize(field.field_id, Math.min(20, next));
+                            }}
+                          >
+                            <Plus size={14} />
+                          </button>
+                          <button
+                            type="button"
+                            title="Auto font size"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              setFontSize(field.field_id, null);
+                            }}
+                            disabled={currentFontSize == null}
+                            className="ml-1 text-xs font-semibold text-primary disabled:text-muted-foreground"
+                          >
+                            Auto
+                          </button>
+                        </>
+                      )}
+                    </div>
                   </div>
                   <label
                     className="mt-2 block text-xs font-medium text-muted-foreground"
@@ -1596,7 +1701,7 @@ function WorkflowResultScreen({
                   <input
                     id={`edit-${field.field_id}`}
                     value={currentValue}
-                    disabled={field.field_type.toLowerCase().includes("signature")}
+                    disabled={isSignature}
                     onFocus={() => {
                       setSelectedId(field.field_id);
                       setPage(field.page);
@@ -1605,14 +1710,6 @@ function WorkflowResultScreen({
                     className="mt-1 w-full rounded-md border border-border bg-white px-3 py-2 text-sm text-foreground outline-none focus:border-primary focus:ring-2 focus:ring-primary/20 disabled:bg-muted"
                     placeholder="Enter a value"
                   />
-                  {field.source_quote && (
-                    <p className="mt-2 text-xs text-muted-foreground">
-                      Evidence: {field.source_quote}
-                    </p>
-                  )}
-                  {field.reason && (
-                    <p className="mt-2 text-xs text-amber-800">Review: {field.reason}</p>
-                  )}
                 </div>
               );
             })}
@@ -1660,6 +1757,52 @@ function zoomStep(current: number, direction: -1 | 1) {
   const nextIndex = zoomLevels.findIndex((level) => level >= current);
   const index = nextIndex === -1 ? zoomLevels.length - 1 : nextIndex;
   return zoomLevels[Math.min(zoomLevels.length - 1, Math.max(0, index + direction))] ?? defaultZoom;
+}
+
+function FieldInfoPopover({
+  field,
+  onClose,
+}: {
+  field: ReturnType<typeof toReviewFields>[number] | null;
+  onClose: () => void;
+}) {
+  if (!field) return null;
+  const status =
+    field.status === "filled" ? "Filled" : field.status === "missing" ? "Missing" : "Skipped";
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="max-w-sm">
+        <DialogHeader>
+          <DialogTitle className="text-base">{field.label}</DialogTitle>
+          <DialogDescription className="text-xs">Field details</DialogDescription>
+        </DialogHeader>
+        <div className="space-y-3 text-sm">
+          <div className="flex items-center justify-between">
+            <span className="text-muted-foreground">Status</span>
+            <span className="font-medium">{status}</span>
+          </div>
+          <div className="flex items-center justify-between">
+            <span className="text-muted-foreground">Type</span>
+            <span className="font-medium">{field.field_type}</span>
+          </div>
+          {field.source_quote && (
+            <div>
+              <span className="text-muted-foreground">Evidence</span>
+              <p className="mt-1 rounded-md bg-muted/50 p-2 text-xs">{field.source_quote}</p>
+            </div>
+          )}
+          {field.reason && (
+            <div>
+              <span className="text-muted-foreground">Review note</span>
+              <p className="mt-1 rounded-md bg-warning/10 p-2 text-xs text-warning">
+                {field.reason}
+              </p>
+            </div>
+          )}
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
 }
 
 function ResultScreen({
